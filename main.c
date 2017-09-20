@@ -322,10 +322,76 @@ static noinline void __ref rest_init(void)
 	int pid;
 	
 	rcu_scheduler_starting();
+	/*
+	** We need to spawn init first so that it obtain pid 1, however
+	** the init task will end up wanting to create kthreads, which, if
+	** we schedule it before we create kthreadd, will OOPS.
+	*/
+	pid = kernel_thread(kernel_init, NULL, CLONE_FS);
+	/*
+	** Pin init on the boot CPU.Task migraton is not properly working
+	** until sched_init_smp() has been run. It will set the allowed
+	** CPUs for init to the non isolated CPUS.
+	*/
+	rcu_read_lock();
+	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
+	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
+	rcu_read_unlock();
+	
+	numa_default_policy();
+	pid = kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES);
+	rcu_read_lock();
+	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+	rcu_read_unlock();
+	/**
+	** Enable might_sleep() and smp_processor_id() checks.
+	** They cannot be enabled earlier because with CONFIG_PREEMPT=y
+	** kernel_thread() would trigger might_sleep() splats. With
+	** CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
+	** already,but it's stuck on the threadadd_done completion.
+	*/
+	system_state = SYSTEM_SCHEDULING;
+	complete(&kthreadd_done);
+	
+	/*
+	** The boot idle thread must execute schedule()
+	** at least once to get things moving:
+	** 
+	*/
+	schedule_preempt_disabled();
+	/* Call into cpu_idle with preempt disabled */
+	cpu_startup_entry(CPUHP_ONLINE);
 	
 	
 }
+/* Check for early params */
+static int __init do_early_param(char *param, char *val,
+						const char *unused, void *arg);
+{
+	const struct obs_kernel_param *p;
+	
+	for(p = __setup_start; i < __setup_end; p++) {
+		if((p->early && parameq(param, p->str)) ||
+			(strcmp(param, "console") == 0 && 
+			(strcmp(p->str, "earlycon") == 0 )
+		) {
+			if(p->setup_func(val) != 0)
+				pr_warn("Malformed early option '%s'\n", param);
+		}
+	}
+	
+	/* We accept everything at this stage. */
+	return 0;
+}
 
+void __init parse_early_options(char *cmdline)
+{
+	parse_args("early_options", cmdline, NULL, 0, 0, 0, NULL,
+		do_early_param);
+}
+
+
+							
 
 
 
