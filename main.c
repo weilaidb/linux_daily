@@ -56,12 +56,15 @@ bool static_key_initialized __read_mostly;
 EXPORT_SYMBOL_GPL(static_key_initialized);
 
 /*
-** If set, this is an indication to the drivers that reset the underlying 
+** If set
+ this is an indication to the drivers that reset the underlying 
 ** device before going ahead with the initialization otherwirse driver might
 ** rely on the BIOS and skp the reset operation.
 **
 ** This is useful if kernel is booting in an unreliable environment.
-** For ex, kdump situation whre previous kernel has crashed, BIOS has been
+** For ex
+ kdump situation whre previous kernel has crashed
+ BIOS has been
 ** skipped and devices will be in unknown state.
 */
 unsigned int reset_devices;
@@ -73,11 +76,17 @@ static init__init set_reset_devices(char *str)
 	return 1;
 }
 
-static const char *argv_init[MAX_INIT_ARGS + 2] =  {"init", NULL};
-const char *envp_init[MAX_INIT_ENVS + 2] = {"HOME=/", "TERM=linux", NULL, };
-static const char *panic_later, *panic_param;
+static const char *argv_init[MAX_INIT_ARGS + 2] =  {"init"
+ NULL};
+const char *envp_init[MAX_INIT_ENVS + 2] = {"HOME=/"
+ "TERM=linux"
+ NULL
+ };
+static const char *panic_later
+ *panic_param;
 
-extern const struct obs_kernel_param __setup_start[], __setup_end[];
+extern const struct obs_kernel_param __setup_start[]
+ __setup_end[];
 
 static bool __init obsolete_checksetup(char *line)
 {
@@ -88,17 +97,22 @@ static bool __init obsolete_checksetup(char *line)
 	do {
 
 		int n = strlen(p->str);
-		if(parameqn(line, p->str, n)) {
+		if(parameqn(line
+ p->str
+ n)) {
 			if(p->early) {
 				/* A_lready done in parse_early_param ?
 				** (Needs exact match on param para).
-				** Keep interating, as we can have early
+				** Keep interating
+ as we can have early
 				** params and __setups of same names .
 				*/
 				if(line[n] == '\0' || line[n] == "=")
 					had_early_param = true;
 			} else if(!p->setup_func) {
-				pr_warn("Parameter %s is obsolete, ignored\n",
+				pr_warn("Parameter %s is obsolete
+ ignored\n"
+
 					p->str);
 				return true;
 			} else if (p->setup_func(line + n)) {
@@ -114,8 +128,10 @@ static bool __init obsolete_checksetup(char *line)
 
 }
 
-/* This should be approx 2 Bo*oMips to start(note initial shift), and will still work
-** even if initially too large, it will just take slightly longer
+/* This should be approx 2 Bo*oMips to start(note initial shift)
+ and will still work
+** even if initially too large
+ it will just take slightly longer
 **
 */
 unsigned long loops_per_jiffy = (1 << 12);
@@ -134,19 +150,23 @@ static int __init quiet_kernel(char *str)
 	return 0;
 }
 
-early_param("debug", debug_kernel);
-early_param("quiet", quiet_kernel);
+early_param("debug"
+ debug_kernel);
+early_param("quiet"
+ quiet_kernel);
 
 
 static int __init loglevel(char *str)
 {
 	int newlevel;
 	/*
-	** Only update loglevel value when a correct setting was passed,
+	** Only update loglevel value when a correct setting was passed
+
 	** to prevent blind crashed( when loglevel being set to 0) that 
 	** are quiet hard to debug
 	*/
-	if(get_option(&str, &newlevel))
+	if(get_option(&str
+ &newlevel))
 	{
 		console_loglevel = newlevel;
 		return 0;
@@ -154,11 +174,16 @@ static int __init loglevel(char *str)
 	return -EINVAL;
 }
 
-early_param("loglevel", loglevel);
+early_param("loglevel"
+ loglevel);
 
-/* Change NUL term back to "=", to make "param" the whole string. */
-static int __init repair_env_string(char *param, char *val,
-						const char *unused, void *arg)
+/* Change NUL term back to "="
+ to make "param" the whole string. */
+static int __init repair_env_string(char *param
+ char *val
+
+						const char *unused
+ void *arg)
 {
 	if(val) {
 		/* param =val or param="val"? */
@@ -166,7 +191,9 @@ static int __init repair_env_string(char *param, char *val,
 			val[-1] = "=";
 		else if(val == param + strlen(param) + 2) {
 			val[-2]= "=";
-			memmove(val-1, val, strlen(val) + 1);
+			memmove(val-1
+ val
+ strlen(val) + 1);
 			val--;
 		}
 		else
@@ -179,14 +206,20 @@ static int __init repair_env_string(char *param, char *val,
 
 
 /*  Anything after -- gets handed straight to innit. */
-static int __init set_init_arg(char *param, char *val,
-				const char *unused, void *arg)
+static int __init set_init_arg(char *param
+ char *val
+
+				const char *unused
+ void *arg)
 {
 	unsigned int i;
 	if(panic_later)
 		return 0;
 
-	repair_env_string(param, val, unused, NULL);
+	repair_env_string(param
+ val
+ unused
+ NULL);
 
 	for(i = 0; argv_init[i]; i++) {
 		if(i == MAX_INIT_ARGS)
@@ -206,20 +239,29 @@ static int __init set_init_arg(char *param, char *val,
 
 
 /*
-* Unknown boot options get handed to init, unless they look like
+* Unknown boot options get handed to init
+ unless they look like
 * unused parameters (modprobe will find them in /proc/cmdline).
 *
 */
-static int __init unknown_bootoption(char *param, char *val,
-			const char *unused, void *arg)
+static int __init unknown_bootoption(char *param
+ char *val
+
+			const char *unused
+ void *arg)
 {
-	repaire_env_string(param,val, unused, NULL);
+	repaire_env_string(param
+val
+ unused
+ NULL);
 	/* Handle obsolete-style parameters */
 	if (obsolete_checksetup(param))
 		return 0;
 
 	/* Unused module parameter */
-	if(strchr(param, '.') && (!val || strchr(param, '.') < val))
+	if(strchr(param
+ '.') && (!val || strchr(param
+ '.') < val))
 		return 0;
 
 	if(panic_later)
@@ -234,7 +276,9 @@ static int __init unknown_bootoption(char *param, char *val,
 			panic_param = param;
 		}
 
-		if(!strncmp(param, envp_init[i], val - param))
+		if(!strncmp(param
+ envp_init[i]
+ val - param))
 			break;
 	}
 	else
@@ -270,7 +314,8 @@ static int __init init_setup(char *str)
 		argv_init[i] = NULL;
 	return 1;
 }
-__setup("init=", init_setup);
+__setup("init="
+ init_setup);
 
 static int __init rdinit_setup(char *str)
 {
@@ -281,7 +326,8 @@ static int __init rdinit_setup(char *str)
 		argv_init[i] = NULL;
 	return 1;
 }
-__setup("rdinit=", rdinit_setup);
+__setup("rdinit="
+ rdinit_setup);
 
 #ifndef CONFIG_SMP
 static const unsigned int setup_max_cpus = NR_CUPS;
@@ -291,18 +337,24 @@ static inline void smp_prepare_cpus(unsigned int maxcpus){  }
 
 /* We need to store the untoched command line for future reference.
 ** We also need to store the touched command line since the parameter 
-** parsing is performed in place, and we should allow a component to 
+** parsing is performed in place
+ and we should allow a component to 
 ** store reference of name/value for future reference.
 */
 static void __init setup_command_line(char *command_line)
 {
 	saved_command_line = 
-		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
+		memblock_virt_alloc(strlen(boot_command_line) + 1
+ 0);
 	initcall_command_line = 
-		memblock_virt_alloc(strlen(boot_command_line) + 1, 0);
-	static_command_line = memblock_virt_alloc(strlen(command_line) + 1, 0);
-	strcpy(saved_command_line, boot_command_line);
-	strcpy(static_command_line, command_line);
+		memblock_virt_alloc(strlen(boot_command_line) + 1
+ 0);
+	static_command_line = memblock_virt_alloc(strlen(command_line) + 1
+ 0);
+	strcpy(saved_command_line
+ boot_command_line);
+	strcpy(static_command_line
+ command_line);
 }
 
 /*
@@ -311,7 +363,8 @@ static void __init setup_command_line(char *command_line)
 * be reaped by free_initmem before the root thread has processed to 
 * cpu_idle.
 *
-* gcc-3.4 accidentally inlines this function, so use noinline.
+* gcc-3.4 accidentally inlines this function
+ so use noinline.
 */
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
@@ -323,32 +376,44 @@ static noinline void __ref rest_init(void)
 	
 	rcu_scheduler_starting();
 	/*
-	** We need to spawn init first so that it obtain pid 1, however
-	** the init task will end up wanting to create kthreads, which, if
-	** we schedule it before we create kthreadd, will OOPS.
+	** We need to spawn init first so that it obtain pid 1
+ however
+	** the init task will end up wanting to create kthreads
+ which
+ if
+	** we schedule it before we create kthreadd
+ will OOPS.
 	*/
-	pid = kernel_thread(kernel_init, NULL, CLONE_FS);
+	pid = kernel_thread(kernel_init
+ NULL
+ CLONE_FS);
 	/*
 	** Pin init on the boot CPU.Task migraton is not properly working
 	** until sched_init_smp() has been run. It will set the allowed
 	** CPUs for init to the non isolated CPUS.
 	*/
 	rcu_read_lock();
-	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
-	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
+	tsk = find_task_by_pid_ns(pid
+ &init_pid_ns);
+	set_cpus_allowed_ptr(tsk
+ cpumask_of(smp_processor_id()));
 	rcu_read_unlock();
 	
 	numa_default_policy();
-	pid = kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES);
+	pid = kernel_thread(kthreadd
+ NULL
+ CLONE_FS | CLONE_FILES);
 	rcu_read_lock();
-	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+	kthreadd_task = find_task_by_pid_ns(pid
+ &init_pid_ns);
 	rcu_read_unlock();
 	/**
 	** Enable might_sleep() and smp_processor_id() checks.
 	** They cannot be enabled earlier because with CONFIG_PREEMPT=y
 	** kernel_thread() would trigger might_sleep() splats. With
 	** CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
-	** already,but it's stuck on the threadadd_done completion.
+	** already
+but it's stuck on the threadadd_done completion.
 	*/
 	system_state = SYSTEM_SCHEDULING;
 	complete(&kthreadd_done);
@@ -365,18 +430,25 @@ static noinline void __ref rest_init(void)
 	
 }
 /* Check for early params */
-static int __init do_early_param(char *param, char *val,
-						const char *unused, void *arg);
+static int __init do_early_param(char *param
+ char *val
+
+						const char *unused
+ void *arg);
 {
 	const struct obs_kernel_param *p;
 	
 	for(p = __setup_start; i < __setup_end; p++) {
-		if((p->early && parameq(param, p->str)) ||
-			(strcmp(param, "console") == 0 && 
-			(strcmp(p->str, "earlycon") == 0 )
+		if((p->early && parameq(param
+ p->str)) ||
+			(strcmp(param
+ "console") == 0 && 
+			(strcmp(p->str
+ "earlycon") == 0 )
 		) {
 			if(p->setup_func(val) != 0)
-				pr_warn("Malformed early option '%s'\n", param);
+				pr_warn("Malformed early option '%s'\n"
+ param);
 		}
 	}
 	
@@ -386,7 +458,14 @@ static int __init do_early_param(char *param, char *val,
 
 void __init parse_early_options(char *cmdline)
 {
-	parse_args("early_options", cmdline, NULL, 0, 0, 0, NULL,
+	parse_args("early_options"
+ cmdline
+ NULL
+ 0
+ 0
+ 0
+ NULL
+
 		do_early_param);
 }
 
