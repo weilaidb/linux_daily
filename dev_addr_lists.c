@@ -575,8 +575,276 @@ int dev_uc_sync_multiple(struct net_device *to, struct net_device *from)
 }
 EXPORT_SYMBOL(dev_uc_sync_multiple);
 
+/**
+** dev_to_unsync - Remove synchronized addresses from the destination device
+** @to : destination device
+** @from : source device
+**
+** Remove all addresses that were added to the destination device by 
+** dev_uc_sync(). This function is intended to be called from the 
+** dev->stop function of layered software devices.
+**/
+void dev_uc_unsync(struct net_device *to, struct net_device *from)
+{
+	if(to->addr_len != from->addr_len)
+		return;
+	
+	netif_addr_lock_bh(from);
+	netif_addr_lock_nested(to);
+	__hw_addr_unsync(&to->uc, &from->uc, to->addr_len);
+	__dev_set_rx_mode(to);
+	netif_addr_unlock(to);
+	netif_addr_unlock_bh(from);
+}
+EXPORT_SYMBOL(dev_uc_unsync);
 
+/**
+** dev_uc_flush - Flush unicast addresses 
+** @dev: device
+**
+**
+** Flush unicast addresses
+**/
+void dev_uc_flush(struct net_device *dev)
+{
+	netif_addr_lock_bh(dev);
+	__hw_addr_flush(&dev->uc);
+	netif_addr_unlock_bh(dev);
+}
+EXPORT_SYMBOL(dev_uc_flush);
 
+/**
+** dev_uc_flush - Init unicast address list
+**
+** Init unicast address list.
+**/
+void dev_uc_init(struct net_device *dev)
+{
+	__hw_addr_init(&dev->uc);
+}
+EXPORT_SYMBOL(dev_uc_init);
+
+/**
+**Multicasst list handling functions
+**/
+/**
+** dev_mc_add_excl - Add a global secondary multicast address
+** @dev: device
+** @addr: address to add 
+**/
+int dev_mc_add_excl(struct net_device *dev, const unsigned char * addr)
+{
+	struct netdev_hw_addr *ha;
+	int err;
+	
+	netif_addr_lock_bh(dev);
+	list_for_each_entry(ha, &dev->mc.list,list){
+		if(!memcmp(ha->addr, addr, dev->addr_len) &&
+			ha->type == NETDEV_HW_ADDR_T_MULTICAST){
+				err = -EEXIST;
+				goto out;
+				
+			}
+	}
+	err = __hw_addr_create_ex(&dev->mc,addr,dev->addr_len,
+					NETDEV_HW_ADDR_T_MULTICAST, true, false);
+	if(!err)
+		__hw_set_rx_mode(dev);
+out:
+	netif_addr_unlock_bh(dev);
+	return err;
+}
+EXPORT_SYMBOL(dev_uc_add_excl);
+
+static int __dev_mc_add(struct net_device *dev, const unsigned char *addr,
+					bool global)
+{
+	int err;
+	
+	netif_addr_lock_bh(dev);
+	err = __hw_addr_add_ex(&dev->mc, addr, dev->addr_len,		
+						NETDEV_HW_ADDR_T_MULTICAST, global, false, 0);
+	if(!err)
+		__dev_set_rx_mode(dev);
+	netif_addr_unlock_bh(dev);
+	return err;
+}
+
+/**
+** dev_mc_add - Add a multicast address 
+** @dev: device
+** @addr: address to add 
+**
+** Add a multicast address to the device or increase
+** the reference count if it already exists.
+**/
+int dev_mc_add(struct net_device *dev, const unsigned char *addr)
+{
+	return __dev_mc_add(dev, addr, false);
+}
+EXPORT_SYMBOL(dev_mc_add);
+
+/**
+** dev_mc_add_global - Add a global multicast address .
+** @dev : device
+** @addr : address to add 
+**
+** Add a global multicast address to the device
+**/
+int dev_mc_add_global(struct net_device *dev, const unsigned char *addr)
+{
+	return __dev_mc_add(dev, addr, true);
+}
+EXPORT_SYMBOL(dev_mc_add_global);
+
+static int __dev_mc_del(struct net_device *dev, const unsigned char *addr,
+			bool global)
+{
+	int err;
+	
+	netif_addr_lock_bh(dev);
+	err = __hw_addr_del_ex(&dev->mc, addr, dev->addr_len,
+					NETDEV_HW_ADDR_T_MULTICAST, global, false);
+	if(!err)
+		__dev_set_rx_mode(dev);
+	netif_addr_unlock_bh(dev);
+	return err;
+}
+
+/**
+** dev_mc_del - Delete a multicast address.
+** @dev : device
+** @addr: address to delete
+**
+** Release reference to a multicast address and remove it 
+** from the device if the reference count drops to zero.
+**/
+int dev_mc_del(struct net_device *dev, const unsigned char *addr)
+{
+	return __dev_mc_del(dev, addr, false);
+}
+EXPORT_SYMBOL(dev_mc_del);
+
+/** 
+** dev_mc_del_global - Delete a global multicast address.
+** @dev : device
+** @addr: address to delete
+**
+** Release reference to a multicast address and remove it 
+** from the device if the reference count drops to zero.
+**/
+int dev_mc_del_global(struct net_device *dev,  const unsigned char *addr)
+{
+	return __dev_mc_del(dev, addr, true);
+}
+EXPORT_SYMBOL(dev_mc_del_global);
+
+/**
+** dev_mc_sync - Synchronize device's multicast list to another device
+** @to : destination device
+** @from: source device
+**
+** Add newly added addresses to the destination device and release
+** addresses that have no users left. The source device must be 
+** locked by netif_addr_lock_bh.
+**
+** This function is intended to be called from the ndo_set_rx_mode
+** function of layered software devices.
+**/
+int dev_mc_sync(struct net_device *to, struct net_device *from)
+{
+	int err = 0;
+	
+	if(to->addr_len != from->addr_len)
+		return -EINVAL;
+	
+	netif_addr_lock_nested(to);
+	err = __hw_addr_sync(&to->mc, &from->mc, to->addr_len);
+	if(!err)
+		__dev_set_rx_mode(to);
+	netif_addr_unlock(to);
+	return err;
+	
+}
+EXPORT_SYMBOL(dev_mc_sync);
+
+/**
+** dev_mc_sync_multiple - Synchronize device's multicast list to another 
+** device, but allow for multiple calls to sync to multiple devices.
+** @to: destination device
+** @from: source device
+**
+** Add newly added addresses to the destination device and release
+** addresses that have no users left. The source device must be 
+** locked by netif_addr_lock_bh.
+**
+** This function is intended to be called from the ndo_set_rx_mode 
+** function of layered software  devices. It alows for a single
+** source device to be synced to multiple destination devices.
+**/
+int dev_mc_sync_multiple(struct net_device *to, struct net_device *from)
+{
+	int err = 0;
+	
+	if(to->addr_len != from->addr_len)
+		return -EINVAL;
+	netif_addr_lock_nested(to);
+	err = __hw_addr_sync_multiple(&to->mc, &from->mc, to->addr_len);
+	if(!err)
+		__dev_set_rx_mode(to);
+	netif_addr_unlock(to);
+	return err;
+}
+EXPORT_SYMBOL(dev_mc_sync_multiple);
+
+/**
+** dev_mc_unsync - Remove synchronized addresses from the destination device 
+** @to : destination device 
+** @from : source device
+**
+** Remove all addresses that were added to the destination device by 
+** dev_mc_sync(). This function is intended to be called from the 
+** dev->stop function of layered software devices.
+**/
+void dev_mc_unsync(struct net_device *to, struct net_device *from)
+{
+	if(to->addr_len != from->addr_len)
+		return;
+	
+	netif_addr_lock_bh(from);
+	netif_addr_lock_nested(to);
+	__hw_addr_unsync(&to->mc, &from->mc, to->addr_len);
+	__dev_set_rx_mode(to);
+	netif_addr_unlock(to);
+	netif_addr_unlock_bh(from);
+}
+EXPORT_SYMBOL(dev_mc_unsync);
+
+/**
+** dev_mc_flush - Flush multicast addresses
+** @dev : device
+** 
+** Flush  multicast addresses.
+**/
+void dev_mc_flush(struct net_device *dev)
+{
+	netif_addr_lock_bh(dev);
+	__hw_addr_flush(&dev->mc);
+	netif_addr_unlock_bh(dev);
+}
+EXPORT_SYMBOL(dev_mc_flush);
+
+/**
+** dev_mc_init - Init multicast address list.
+** @dev : device
+**
+** Init multicast address list.
+**/
+void dev_mc_init(struct net_device *dev)
+{
+	__hw_addr_init(&dev->mc);
+}
+EXPORT_SYMBOL(dev_mc_init);
 
 
 
