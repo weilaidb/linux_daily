@@ -320,42 +320,216 @@ static int dev_ifsioc(struct net *net , struct ifreq *ifr, unsigned int cmd)
 	return err;
 }
 
+/**
+** dev_load - load a network module
+** @net: the applicable net namespace
+** @name: name of interface
+**
+** If a network interface is not present and the process has suitable
+** privileges this function loads the module. If module loading is not available 
+** in this kernel then it becomes a nop.
+**/
+void dev_load(struct net *net, const char *name)
+{
+	struct net_device *dev;
+	int no_module;
+	
+	rcu_read_lock();
+	dev = dev_get_by_name_rcu(net, name);
+	rcu_read_unlock();
+	
+	no_module = !dev;
+	if(no_module && capable(CAP_NEt_ADMIN))
+		no_module = request_module("netdev-%s", name);
+	if(no_module && capable(CAP_SYS_MODULE))
+		request_module("%s", name);
+}
+EXPORT_SYMBOL(dev_load);
 
+/** 
+** This function handles all "interface" - type I/O control requests.The actual
+** 'doing' part of this is dev_ifsioc above.
+**/
+/**
+** dev_ioctl - network device ioctl
+** @net: the applicable net namespace
+** @cmd: command to issue
+** @arg: pointer to a struct ifreq in user space 
+**
+** Issue ioctl functions to devices.This is normally called by the 
+** user space syscall interfaces but can sometimes be useful for 
+** other purposes. The return value is the return from the syscall if 
+** positive or a negative errno code on error.
+**/
+int dev_ioctl(struct net *net,unsigned int cmd,void __user *arg)
+{
+	struct ifreq ifr;
+	int ret;
+	char *colon;
+	
+	/** One special case: SIOCGIFCONF takes ifconf argument
+		and requires shared lock,because it sleeps writing
+		to user space.
+	**/
+	if(cmd == SIGCGIFCONF) {
+		rtnl_lock();
+		ret = dev_ifconf(net, (char __user *)arg);
+		rtnl_unlock();
+		return ret;
+	}
+	if(cmd == SIGCGIFNAME)
+		return dev_ifname(net, (struct ifreq __user*)arg);
+	/**
+	** Take care of Wireless Extensions. Unfortunately struct iwreq
+	** isn't a proper subset of struct ifreq(it's 8 byte shorter)
+	** so we need to treat it specially, otherwise applications may
+	** fault if the struct they're passing happens to land at the 
+	** end of a mapped page.
+	**/
+	if(cmd >= SIOCIWFIRST && cmd <= SIOCIWLAST) {
+		struct iwreq iwr;
+		
+		if(copy_from_user(&iwr, arg, sizeof(iwr))){
+			return -EFAULT;
+		}
+		iwr.ifr_name[sizeof(iwr.ifr_name) -1] = 0;
+		
+		return wext_handle_ioctl(net, &iwr, cmd,arg);
+	}
+	
+	if(copy_from_user(&ifr, arg, sizeof(struct ifreq)))
+		return -EFAULT;
+	
+	ifr.ifr_name[IFNAMESIZ -1 ] = 0;
+	
+	colon = strchr(ifr.ifr_name, ':');
+	if(colon)
+		*colon = 0;
+	
+	/**
+	** See which interface the caller  is talking about.
+	**/
+	
+	switch(cmd){
+		/**
+		** These ioctl calls:
+		** - can be done by all.
+		** - atomic and do not require locking.
+		** - return a value 
+		**/
+		case SIOCGIFFLAGS:
+		case SIOCGIFMETRIC:
+		case SIOCGIfMTU:
+		case SIOCGIFHWADDR:
+		case SIOCGIFSLAVE:
+		case SIOCGIFMAP:
+		case SIOCGIFINDEX:
+		case SIOCGIFTXQLEN:
+			dev_load(net, ifr.ifr_name);
+			rcu_read_lock();
+			ret = dev_ifsioc_locked(net, &ifr, cmd);
+			rcu_read_unlock();
+			if(!ret){
+				if(colon)
+					*colon = ':';
+				if(copy_to_user(arg, &ifr, sizeof(struct ifreq)))
+					ret = -EFAULT;
+			}
+			return ret;
+			/**
+			** These ioctl calls:
+			** - require superuser power.
+			** - require strict serialization.
+			** - return a value.
+			**/
+			case SIOCGMIIPHY:
+			case SIOCGMIIREG:
+			case SIOCSIFNAME:
+				if(!ns_capable(net->user_ns, CAP_NET_ADMIN))
+					return -EPERM;
+				dev_load(net, ifr.ifr_name);
+				rtnl_lock();
+				ret = dev_ifsioc(net, &ifr, cmd);
+				rtn_unlock();
+				if(!ret){
+					if(colon)
+						*colon = ':';
+					if(copy_to_user(arg, &ifr, sizeof(struct ifreq)))
+						ret = -EFAULT;
+				}
+				return ret;
+				/**
+				** These ioctl calls:
+				** - require superuser power.
+				** - require strict serialization.
+				** - do not return a value
+				**/
+				case SIOCSIFMAP:
+				case SIOCSIFTXQLEN:
+					if(!capable(CAP_NET_ADMIN))
+						return -EPERM;
+					/** fall through **/
+				/**
+				** These ioctl calls:
+				** - require local superuser power.
+				** - require strict serialization.
+				** - do not return a value
+				**/
+				case SIOCSIFFLAGS:
+				case SIOCSIFMETRIC:
+				case SIOCSIFMTU:
+				case SIOCSIFHWADDR:
+				case SIOCSIFSLAVE:
+				case SIOCADDMULTI:
+				case SIOCDELMULTI:
+				case SIOCSIFHWBROADCAST:
+				case SIOCSMIIREG:
+				case SIOCBONDENSLAVE:
+				case SIOCBONDRELEASE:
+				case SIOCBONDCHANGEACTIVE:
+				case SIOCBRADDIF:
+				case SIOCBRDELIF:
+				case SIOCSHWTSTAMP:
+					if(!ns_capable(net->user_ns, CAP_NET_ADMIN))
+						return -EPERM;
+					/** fall through **/
+				case SIOCBONDSLAVEINFOQUERY:
+				case SIOCBONDINFOQUERY:
+					dev_load(net, ifr.ifr_name);
+					rtnl_lock();
+					ret = dev_ifsioc(net, &ifr, cmd);
+					rtnl_unlock();
+					return ret;
+				
+				case SIOCGIFMEM:
+					/** Get the per device memory space. We can add this but 
+					** currently do not support it **/
+				case SIOCSIFMEM:
+					/** Set the per device memory buffer space.
+					** Not applicable in our case **/
+				case SIOcSIFLINK:
+					return -ENOTTY;
+					
+				/** 
+				** Unknown or private ioctl.
+				**/
+				default:
+					if(cmd == SIOCWANDEV ||
+						cmd == SIOCGHWTSTAMP ||
+						(cmd >= SIOCDEVPRIVATE &&
+						cmd <= SIOCDEVPRIVATE + 15)) {
+						dev_load(net, ifr.ifr_name);
+						rtnl_lock();
+						ret = dev_ifsioc(net, &ifr, cmd);
+						rtnl_unlock();
+						if(!ret && copy_to_user(arg, &ifr, sizeof(struct ifreq)))
+							ret = -EFAULT;
+						return ret;
+					}
+					return -ENOTTY;
+	}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+}
 
 
 
