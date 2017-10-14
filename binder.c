@@ -443,12 +443,480 @@ struct binder_ref {
 	struct binder_ref_death *death;
 };
 
+enum binder_deferred_state {
+	BINDER_DEFERRED_PUT_FILES = 0x1,
+	BINDER_DEFERRED_FLUSH     = 0x2,
+	BINDER_DEFERRED_RELEASE   = 0x3,
+};
 
+/** 
+** struct binder_proc - binder process bookkepping
+** @proc_node:  element for binder_procs list
+** @threads:   rbtree of binder_threads in this pro
+**             (protected by @inner_lock )
+** @nodes:   rbtree of binder nodes associated with
+**           this proc ordered by node->ptr
+**           (protected by @inner_lock)
+** @refs_by_desc :  rbtree of refs ordered by ref->desc
+**            (protected by @outer_lock)
+** @waiting_threads: threads currently waiting for proc work
+**             (protected by @inner_lock)
+** @pid:  PID of group_leader of process
+**          (invariant after initialized)
+** @tsk:      task_struct for group_leader of process
+**          (invariant after initialized)
+** @deferred_work_node: element for binder_deferred_list
+**           (protected by binder_deferred_lock)
+** @deferred_work:  bitmap of deferred work to performed
+**           (protected by binder_deferred_lock)
+** @is_dead: process is dead and awaiting free
+**           when outstanding transactions are cleanup up
+**           (protected by @inner_lock)
+** @todo:     list of work for this process
+**            (protected by @inner_lock)
+** @wait:    wait queue head to wait for proc work
+**            (invariant after initialized)
+** @stats:   per-process binder statistics
+**            (atomics, no lock needed)
+** @delivered_death:  list of delivered death notification
+**            (protected by @inner_lock)
+** @max_threads: cap on number of binder threads
+**            (protected by @inner_lock)
+** @requested_threads: number of binder threads requested but not
+**            yet started. In current implementation, can 
+** 			   only be 0 or 1.
+** @requested_threads_started: number binder threads started
+**            (protected by @inner_lock)
+** @tmp_ref:   temporary references to indicate proc is in use 
+**             (protected by @inner_lock)
+** @default_priority: default scheduler priority
+**             (invariant after initialized)
+** @debugfs_entry:  debugfs node 
+** @alloc:   binder allocator bookkeeping
+** @context:  binder_context for this proc
+**            
+** @inner_lock:  can nest under outer_lock and/or node lock
+** @outer_lock: no nesting under innor or node lock
+**
+**
+** Bookkeeping structure for binder processes
+**/
+struct binder_proc {
+	struct hlist_node proc_node;
+	struct rb_node threads;
+	struct rb_node nodes;
+	struct rb_node refs_by_desc;
+	struct rb_node refs_by_node;
+	struct list_head waiting_threads;
+	int pid;
+	struct task_struct *tsk;
+	struct files_struct *files;
+	struct hlist_node deferred_work_node;
+	int deferred_work;
+	bool is_dead;
+	
+	struct list_head todo;
+	wait_queue_head_t wait;
+	struct binder_stats stats;
+	struct list_head delivered_death;
+	int max_threads;
+	int requested_threads;
+	int requested_threads_started;
+	int tmp_ref;
+	long default_priority;
+	struct dentry *debugfs_entry;
+	struct binder_alloc alloc;
+	struct binder_context *context;
+	spinlock_t inner_lock;
+	spinlock_t outer_lock;
+};
 
+enum {
+	BINDER_LOOPER_STATE_REGISTERED = 0x01,
+	BINDER_LOOPER_STATE_ENTERED    = 0x02,
+	BINDER_LOOPER_STATE_EXITED     = 0x04,
+	BINDER_LOOPER_STATE_INVALID    = 0x08,
+	BINDER_LOOPER_STATE_WAITING    = 0x10,
+	BINDER_LOOPER_STATE_POLL       = 0x20，
+};
+/**
+** struct binder_thread - binder thread bookkeeping
+** @proc:   binder process for this thread
+**          (invariant after initialization)
+** @rb_node:    element for proc->threads rbtree
+**          (protected by @proc->inner_lock)
+** @waiting_thread_node: element for @proc->waiting_threads list
+**           (protected by @proc->inner_lock)
+** @pid:    PID for this thread
+**          (invariant after initialized)
+** @looper:    bitmap of looping state 
+**             (only accessed by this thread)
+** @looper_needs_return: looping thread needs to exit driver
+**             (no lock needed)
+** @transaction_stack: stack of in-process transaction for this thread
+**             (protected by @proc->inner_lock)
+** @todo:   list of work to do for this thread 
+**              (protected by @proc->inner_lock)
+** @return_error :  transaction errors reported by this thread
+**                (only accessed by this thread)
+** @reply_error:   transaction errors reported by target thread
+**                (protected by @proc->inner_lock)
+** @wait: wait queue for thread work
+** @stats:  per-thread statistics
+**           (atomics,no lock thread)
+** @tmp_ref:   temporary reference to indicate thread is in use 
+**           (atomic since @proc->inner_lock cannot always be acquired)
+** @is_dead: thread is dead and awaiting free
+**           when outstanding transactions are cleaned up
+**           (protected by @proc->inner_lock)
+**
+**
+**
+**
+** Bookkeeping structure for binder threads.
+**/
+struct binder_thread {
+	struct binder_proc *proc;
+	struct rb_node rb_node;
+	struct list_head waiting_thread_node;
+	int pid;
+	int looper; /** only modified by this thread **/
+	bool looper_need_return; /** can be written by other thread **/
+	struct binder_transaction *transaction_stack;
+	struct list_head todo;
+	struct binder_error return_error;
+	struct binder_error reply_error;
+	wait_queue_head_t wait;
+	struct binner_stats stats;
+	atomic_t tmp_ref;
+	bool is_dead;
+};
 
+struct binder_transaction {
+	int debug_id;
+	struct binder_work work;
+	struct binder_thread *from;
+	struct binder_transaction *from_parent;
+	struct binder_proc *to_proc;
+	struct binder_thread *to_thread;
+	struct binder_transaction *to_parent;
+	unsigned need_reply:1;
+	/** unsigned is_dead:1 **/ /**not used at the moment */
+	struct binder_buffer *buffer;
+	unsigned int code;
+	unsigned int flags;
+	long priority;
+	long saved_priority;
+	kuid_t sender_euid;
+	/**
+	** @lock: protects @from, @to_proc, and @to_thread 
+	**
+	** @from,@to_proc, and @to_thread can be set to NULL
+	** during thread teardown
+	**/
+	spinlock_t lock;
+};
 
+/** 
+** binder_proc_lock() - Acquire outer lock for given binder_proc
+**@proc:  struct binder_proc to accquire
+**
+** Acquires proc->outer_lock.Used to protect binder_ref
+** structures associated with the given proc.
+**/
+#define binder_proc_lock(proc) _binder_proc_lock(proc, __LINE__)
+static void 
+_binder_proc_lock(struct binder_proc *proc, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+		"%s:line=%d\n", __func__, line);
+	spin_lock(&proc->outer_lock);
+}
 
+/**
+** binder_proc_unlock() - Release spinlock for given binder_proc
+** @proc:  struct binder_proc to acquire
+**
+** Release lock acquired via binder_proc_lock()
+**/
+#define binder_proc_unlock(_proc) _binder_proc_unlock(_proc, __LINE__)
+static void 
+_binder_proc_unlock(struct binder_proc *proc, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+		"%s:line=%d\n", __func__, line);
+	spin_unlock(&proc->outer_lock);
+}
 
+/**
+** binder_inner_proc_lock() - Acquire inner lock for given binder_proc
+** @proc: struct binder_proc to acquire
+** 
+** Acquires proc->inner_lock. Used to protect todo lists
+**/
+#define binder_inner_proc_lock(proc) _binder_inner_proc_lock(proc, __LINE__)
+static void 
+_binder_inner_proc_lock(struct binder_proc *proc, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+			"%s:line=%d\n", __func__, line);
+	spin_lock(&proc->inner_lock);
+}
+
+/**
+** binder_inner_proc_unlock() - Release inner lock for given binder_proc
+** @proc:  struct binder_proc to acquire
+** 
+** Release lock acquired via binder_inner_proc_lock()
+**/
+#define binder_inner_proc_unlock(proc) _binder_inner_proc_unlock(proc, __LINE__)
+static void 
+_binder_inner_proc_unlock(struct binder_proc *proc, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+		"%s:line=%d\n",__func__, line);
+	spin_unlock(&proc->inner_lock);
+}
+
+/**
+** binder_node_lock - Acquire spinlock for given binder_node
+** @node:   struct binder_node to acquire
+**  
+** Acquires node->lock. Used to protect binder_node fields.
+**/
+#define binder_node_lock(node) _binder_node_lock(node, __LINE__)
+static void 
+_binder_node_lock(struct binder_node *node, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+			"%s:line=%d\n", __func__,line);
+	spin_lock(&node->lock);
+}
+
+/**
+** binder_node_unlock() - Release spinlock for given binder_proc
+** @node:  struct binder_node to acquire
+**
+** Release lock acquired via binder_node_lock()
+**/
+#define binder_node_unlock(node) _binder_node_unlock(node, __LINE__)
+static void 
+_binder_node_unlock(struct binder_node *node, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+			"%s:line=%d\n", __func__, line);
+	spin_unlock(&node->lock);
+}
+/**
+** binder_node_inner_lock() - Acquire node and inner locks
+** @node:  struct binder_node to acquire
+**
+** Acquires node->lock. If node->proc also acquires
+** proc->inner_lock.Used to protect binder_node fields.
+**/
+#define binder_node_inner_lock(node) _binder_node_inner_lock(node, __LINE__)
+static void 
+_binder_node_inner_lock(struct binder_node *node, int line)
+{
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+		"%s:line=%d\n", __func__, line);
+	spin_lock(&node->lock);
+	if(node->proc)
+		binder_inner_proc_lock(node->proc);
+}
+
+/**
+** binder_node_inner_unlock() - Release node and inner locks
+** @node: struct binder_node to acquire
+**  
+** Release lock acquired via binder_node_inner_lock()
+**/
+#define binder_node_inner_unlock(node) _binder_node_inner_unlock(node, __LINE__)
+static void 
+_binder_node_inner_unlock(struct binder_node *node, int line)
+{
+	struct binder_proc *proc = node->proc;
+	
+	binder_debug(BINDER_DEBUG_SPINLOCKS,
+			"%s:line=%d\n", __func__, line);
+	spin_lock(&node->lock);
+}
+
+static bool binder_worklist_empty_ilocked(struct list_head *list)
+{
+	return list_empty(list);
+}
+
+/**
+** binder_worklist_empty() - Check if no items on the work list 
+** @proc: binder_proc associated with list 
+** @list: list to check 
+**
+** Return: true i there are no items on list, else false
+**/
+static bool binder_worklist_empty(struct binder_proc *proc,
+					struct list_head *list)
+{
+	bool ret;
+	
+	binder_inner_proc_lock(proc);
+	ret = binder_worklist_empty_ilocked(list);
+	binder_inner_proc_unlock(proc);
+	return ret;
+}
+static void 
+binder_enqueue_work_ilocked(struct binder_work *work,
+				struct list_head *target_list)
+{
+	BUG_ON(target_list == NULL);
+	BUG_ON(work->entry.next && !list_empty(&work->entry));
+	list_add_tail(&work->entry, target_list);
+}
+
+/**
+** binder_enqueue_work() - Add an item to the work list 
+** @proc:  binder_proc associated with list
+** @work:  struct binder_work to add to list 
+** @target_list: list to add work to 
+**
+** Adds the work to the specified list. Asserts that work 
+** is not already on a list.
+**/
+static void 
+binder_enqueue_work(struct binder_proc *proc,
+			struct binder_work *work,
+			struct list_head *target_list)
+{
+	binder_inner_proc_lock(proc);
+	binder_enqueue_work_ilocked(work, target_list);
+	binder_inner_proc_unlock(proc);
+}
+
+static void 
+binder_dequeue_work_ilocked(struct binder_work *work)
+{
+	list_del_init(&work->entry);
+}
+
+/**
+** binder_dequeue_work() - Removes an item from the work list 
+** @proc:  binder_proc associated with list 
+** @work: struct binder_work to remove from list 
+**
+** Removes the specified work item from whatever list it is on .
+** Can safely be called if work is not on any list.
+**/
+static void 
+binder_dequeue_work(struct binder_proc *proc, struct binder_work *work)
+{
+	binder_inner_proc_lock(proc);
+	binder_dequeue_work_ilocked(work);
+	binder_inner_proc_unlock(proc);
+}
+
+static struct binder_work *binder_dequeue_work_head_ilocked(
+				struct list_head *list)
+{
+	struct binder_work *w;
+	
+	w = list_first_entry_or_null(list, struct binder_work, entry);
+	if(w)
+		list_del_init(&w->entry);
+	return w;
+}
+
+/**
+** binder_dequeue_work_head() - Dequeues the item at head of list
+** @proc: binder_proc associated with list 
+** @list: list to dequeue head 
+**
+** Removes the head of the list if there are items on the list 
+** 
+** Return: pointer  dequeued binder_work, NULL if list was empty.
+**/
+static struct binder_work *binder_dequeue_work_head(
+				struct binder_proc *proc,
+				struct list_head *list)
+{
+	struct binder_work *w;
+	binder_inner_proc_lock(proc);
+	w = binner_dequeue_work_head_ilocked(list);
+	binder_inner_proc_unlock(proc);
+	return w;
+}
+
+static void 
+binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer);
+static void binder_free_thread(struct binder_thread *thread);
+static void binder_free_proc(struct binder_proc *proc);
+static void binder_inc_node_tmpref_ilocked(struct binder_node *node);
+
+static int task_get_unused_fd_flags(struct binder_proc *proc,int flags)
+{
+	struct files_struct *files = proc->files;
+	unsigned long rlim_cur;
+	unsigned long irqs;
+	
+	if(files == NULL)
+		return -ESRCH;
+	
+	if(!lock_task_sighand(proc->tsk, &irqs))
+		return -EMFILE;
+	
+	rlim_cur = task_rlimit(proc->tsk, RLIMIT_NOFILE);
+	unlock_task_sighand(proc->tsk, &irqs);
+	
+	return __alloc_fd(files,0, rlim_cur, flags);
+}
+
+/**
+** copied from fd_install
+**/
+static void task_fd_install(
+	struct binder_proc *proc, unsigned int fd, struct file *file)
+{
+	if(proc->file)
+		__fd_install(proc->files, fd, line);
+}
+
+/**
+** copied from sys_close
+**/
+static long task_close_fd(struct binder_proc *proc,unsigned int fd)
+{
+	int retval;
+	
+	if(proc->files == NULL)
+		return -ESRCH;
+	
+	retval = __close_fd(proc->files, fd);
+	/** can't restart close syscall because file table entry was cleared **/
+	if(unlikely(retval == -ERESTARTSYS ||
+			retval == -ERESTARTNOINTR ||
+			retval == -ERESTARTNOHAND ||
+			retval == -EReSTART_RESTARTBLOCK))
+		retval = -EINTR;
+	return retval;
+}
+
+static bool binder_has_work_ilocked(struct binder_thread *thread, bool do_proc_work)
+{
+	return !binder_worklist_empty_ilocked(&thread->todo) ||
+			thread->looper_need_return ||
+			(do_proc_work &&
+			 !binder_worklist_empty_ilocked(&thread->proc->todo));
+}
+
+static bool binder_has_work(struct binder_thread *thread, bool do_proc_work)
+{
+	bool has_work;
+	
+	binder_inner_proc_lock(thread->proc);
+	has_work = binder_has_work_ilocked(thread, do_proc_work);
+	binder_inner_proc_unlock(thread->proc);
+	
+	return has_work;
+}
 
 
 
