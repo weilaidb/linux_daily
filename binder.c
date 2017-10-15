@@ -918,6 +918,171 @@ static bool binder_has_work(struct binder_thread *thread, bool do_proc_work)
 	return has_work;
 }
 
+static bool binder_available_for_proc_work_ilocked(struct binder_thread *thread)
+{
+	return !thread->transaction_stack &&
+		binder_worklist_empty_ilocked(&threa->todo) &&
+		(thread->looper & (BINDER_LOOPER_STATE_ENTERED |
+			BINDER_LOOPER_STATE_REGISTERED));
+}
+
+static void binder_wakeup_poll_threads_ilocked(struct binder_proc *proc, bool sync)
+{
+	struct rb_node *n;
+	struct binder_thread *thread;
+	
+	for(n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
+		thread = rb_entry(n, struct binder_thread, rb_node);
+		if(thread->looper & BINDER_LOOPER_STATE_POLL && 
+			binder_available_for_proc_work_ilocked(thread)) {
+			if(sync)
+				wake_up_interruptile_sync(&threa->wait);
+			else 
+				wake_up_interruptile(&thread->wait);
+		}
+	}
+}
+
+
+
+/**
+** binder_select_thread_ilock() - selects a thread for doing proc work.
+** @proc: process to select a thread form 
+** 
+** Note that calling this function moves the thread off the waiting_threads
+** list, so it can only be woken up by the caller of this function, or a 
+** signal. Therefore, callers *should* always wake up the thread this function
+** returns.
+**
+** Return: If there's a thread currently waiting for process work,
+**         returns that thread. Otherwise returns NULL.
+**/
+
+static struct binder_thread *
+binder_select_thread_ilocked(struct binder_proc *proc)
+{
+	struct binder_thread *thread;
+	
+	assert_spin_locked(&proc->inner_lock);
+	thread = list_first_entry_or_null(&proc->waiting_threads,
+			struct binder_thread,
+			waiting_thread_node);
+	
+	if(thread)
+		list_del_init(&thread->waiting_thread_node);
+	
+	return thread;
+}
+
+/**
+** binder_wakeup_thread_ilocked() - wakes up a thread for doing proc work.
+** @proc: process to wake up a thread in 
+** @thread: specific thread to wake-up (may be NULL)
+** @sync: whether to do a synchronous wake-up 
+**
+** This function wakes up a thread in the @proc process.
+** The caller may provide a specific thread to wak-up in 
+** the @thread parameter. If @thread is NULL, this function
+** will wake up threads that have called poll().
+**
+** Note that for this function to work as expected, callers
+** should first call binder_select_thread() to find a thread 
+** to handle the work(if they don't have a thread already),
+** and pass the result into the @thread parameter.
+**/
+static void binder_wakeup_thread_ilocked(struct binder_proc *proc,
+			struct binder_thread *thread, bool sync)
+{
+		assert_spin_locked(&proc->inner_lock);
+		
+		if(thread) {
+			if(sync)
+				wake_up_interruptible_sync(&thread->wait);
+			else
+				wake_up_interruptible(&thread->wait);
+			return;
+		}
+		
+		/** 
+		** Didn't find a thread waiting for proc work; this can happen
+		** in two scenarios:
+		** 1. All threads are busy handling transactions
+		**    In that case,one of those threads should call back into 
+		**    the kernel driver soon and pick up this work.
+		** 2.Threads are using the (e)poll interface,in which case 
+		**   they may be blocked on the waitqueue without having been
+		**   over all threads not handling transaction work, and 
+		**   wake them all up. We wake all because we don't know whether 
+		**   a thread that called into (e)poll is handling non-binder 
+		**  work currently.
+		**/
+		binder_wakeup_poll_threads_ilocked(proc, sync);
+}
+
+
+static void binder_wakeup_proc_ilocked(struct binder_proc *proc)
+{
+	struct binder_thread *thread = binder_select_thread_ilocked(proc);
+	
+	binder_wakeup_thread_ilocked(proc, thread /* sync = */ false);
+}
+
+static void binder_set_nice(long nice)
+{
+	long min_nice;
+	
+	if(can_nice(current, nice)) {
+		set_user_nice(current, nice);
+		return;
+	}
+	min_nice = rlimit_to_nice(rlimit(RLIMIT_NICE));
+	binder_debug(BINDER_DEBUG_PRIORITY_CAP,
+		"%d: nice value %ld not allowed use %ld instead\n",
+		current->pid, nice, min_nice);
+	set_user_nice(current, min_nice);
+	if(min_nice <= MAX_NICE)
+		return;
+	binder_user_error("%d RLIMIT_NICE not set\n", current->pid);
+}
+static struct binder_node *binder_get_node_ilocked(struct binder_proc *proc,
+					binder_uintptr_t ptr)
+{
+	struct rb_node *n = proc->nodes.rb_node;
+	struct binder_node *node;
+	
+	assert_spin_locked(&proc->inner_lock);
+	
+	while(n) {
+		node = rb_entry(n, struct binder_node, rb_node);
+		
+		if(ptr < node->ptr)
+			n = n->rb_left;
+		else if (ptr > node->ptr)
+			n = n->rb_right;
+		else {
+			/**
+			** take  an implicit weak reference
+			** to ensure node stays alive until
+			** call to binder_put_node()
+			**/
+			binder_inc_node_tmpref_ilocked(node);
+			return node;
+		}
+	}
+	return NULL;
+}
+
+static struct binder_node *binder_get_node(struct binder_proc *proc,
+					binder_uintptr_t ptr)
+{
+	struct binder_node *node;
+	
+	binder_inner_proc_lock(proc);
+	node = binder_get_node_ilocked(proc, ptr);
+	binder_inner_proc_unlock(proc);
+	return node;
+}
+
 
 
 
