@@ -1083,7 +1083,398 @@ static struct binder_node *binder_get_node(struct binder_proc *proc,
 	return node;
 }
 
+static struct binder_node *binder_init_node_ilocked(
+					struct binder_proc *proc,
+					struct binder_node *new_node,
+					struct flat_binder_object *fp)
+{
+	struct rb_node **p = &proc->nodes.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_node *node;
+	binder_uintptr_t ptr = fp ? fp->binder : 0;
+	binder_uintptr_t cookie = fp ? fp->cookie : 0;
+	__u32 flags = fp ? fp->flags : 0;
+	
+	assert_spin_locked(&proc->inner_lock);
+	
+	while(*p) {
+		parent = *p;
+		node = rb_entry(parent, struct binder_node, rb_node);
+		
+		if(ptr < node->ptr)
+			p = &(*p)->rb_left;
+		else if (ptr > node->ptr)
+			p = &(*p)->rb_right;
+		else {
+			/**
+			** A matching node is already in 
+			** the rb tree. Abandon the init 
+			** and return it .
+			**/
+			binder_inc_node_tmpref_ilocked(node);
+			return node;
+		}
+	}
+	
+	node = new_node;
+	binder_stats_created(BINDER_STAT_NODE);
+	node->tmp_refs++;
+	rb_link_node(&node->rb_node, parent,p);
+	rb_insert_color(&node->rb_node, &proc->nodes);
+	node->debug_id = atomic_inc_return(&binder_last_id);
+	node->proc = proc;
+	node->ptr = ptr;
+	node->cookie = cookie;
+	node->work.type = BINDER_WORK_NODE;
+	node->min_priority = flags & FLAT_BINDER_FLAG_PRIORITY_MASK;
+	node->accept_fds = !!(flags & FLAT_BINDER_FLAG_ACCEPTS_FDS);
+	spin_lock_init(&node->lock);
+	INIT_LIST_HEAD(&node->work.entry);
+	INIT_LIST_HEAD(&node->async_todo);
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		"%d:%d node %d u%016llx c%016llx created\n",
+		proc->pid, current->pid, node->debug_id,
+		(u64)node->ptr, (u64)node->cookie);
+	return node;
+}
 
+
+static struct binder_node *binder_new_node(struct binder_proc *proc,
+					struct flat_binder_object *fp)
+{
+	struct binder_node *node;
+	struct binder_node *new_node = kzalloc(sizeof(*node), GFP_KERNEL);
+	
+	if(!new_node)
+		return NULL;
+	
+	binder_inner_proc_lock(proc);
+	node = binder_init_node_ilocked(proc, new_node, fp);
+	binder_inner_proc_unlock(proc);
+	
+	if(node != new_node){
+		/** 
+		** The node was already added by another thread
+		**/
+		kfree(new_node);
+	}
+	return node;
+}
+
+
+static binder_free_node(struct binder_node *node)
+{
+	kfree(node);
+	binder_stats_deleted(BINDER_STAT_NODE);
+}
+
+static int binder_inc_node_nilocked(struct binder_node *node, int strong,
+					int internal,
+					struct list_head *target_list)
+{
+	struct binder_proc *proc = node->proc;
+	
+	assert_spin_locked(&node->lock);
+	if(proc)
+		assert_spin_locked(&proc->inner_lock);
+	if(strong){
+		if(internal) {
+			if(target_list == NULL && 
+			node->internal_strong_refs  == 0 &&
+			!(node->proc && 
+			node == node->proc->context->binder_context_mgr_node &&
+			node->has_strong_ref)){
+				pr_err("invalid inc strong node for %d\n",
+					node->debug_id);
+				return -EINVAL;
+			}
+			node->internal_strong_refs++;
+		} else 
+			node->local_strong_refs++;
+		if(!node->has_strong_ref && target_list) {
+			binder_dequeue_work_ilocked(&node->work);
+			binder_enqueue_work_ilocked(&node->work, target_list);
+		}
+	} else {
+		if(!internal)
+			node->local_weak_refs++;
+		if(!node->has_weak_ref && list_empty(&node->work.entry)) {
+			if(target_list == NULL) {
+				pr_err("invalid inc weak node for %d\n",
+					node->debug_id);
+				return -EINVAL;
+			}
+			binder_enqueue_work_ilocked(&node->work, target_list);
+		}
+	}
+	return 0;
+}
+
+static int binder_inc_node(struct binder_node *node, int strong, int internal,
+				struct list_head *target_list) 
+{
+	int ret;
+	
+	binder_node_inner_lock(node);
+	ret = binder_inc_node_nilocked(node, strong, internal, target_list);
+	binder_node_inner_unlock(node);
+	
+	return ret;
+}
+
+static bool binder_dec_node_nilocked(struct binder_node *node,
+				int strong, int internal)
+{
+	struct binder_proc *proc = node->proc;
+	
+	assert_spin_locked(&node->lock);
+	if(proc)
+		assert_spin_locked(&proc->inner_lock);
+	if(strong) {
+		if(internal)
+			node->internal_strong_refs--;
+		else
+			node->local_strong_refs--;
+		
+		if(node->local_strong_refs || node->internal_strong_refs)
+			return false;
+	} else {
+		if(!internal)
+			node->local_weak_refs--;
+		if(node->local_weak_refs || node->tmp_refs ||
+			!hlist_empty(&node->refs))
+			return false;
+	}
+	
+	if(proc && (node->has_strong_ref || node->has_weak_ref )) {
+		if(list_empty(&node->work.entry)) {
+			binder_enqueue_work_ilocked(&node->work, &proc->todo);
+			binder_wakeup_proc_ilocked(proc);
+		}
+	} else {
+		if(hlist_empty(&node->refs) && !node->local_strong_refs &&
+			!node->local_weak_refs && !node->tmp_ref) {
+			if(proc) {
+				binder_dequeue_work_ilocked(&node->work);
+				rb_erase(&node->rb_node, &proc->nodes);
+				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+					"refless node %d deleted\n",
+					node->debug_id);
+			} else {
+				BUG_ON(!list_empty(&node->work.entry));
+				spin_lock(&binder_dead_nodes_lock);
+				/**
+				** tmp_refs could have chaned so
+				** check it again
+				**/
+				if(node->tmp_refs) {
+					spin_unlock(&binder_dead_nodes_lock);
+					return false;
+				}
+				hlist_del(&node->dead_node);
+				spin_unlock(&binder_dead_nodes_lock);
+				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+					"dead node %d deleted\n",
+					node->debug_id);
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+static void binder_dec_node(struct binder_node *node, int strong, int internal)
+{
+	bool free_node;
+	
+	binder_node_inner_lock(node);
+	free_node = binder_dec_node_nilocked(node, strong, internal);
+	binder_node_inner_unlock(node);
+	if(free_node)
+		binder_free_node(node);
+}
+
+static void binder_inc_node_tmpref_ilocked(struct binder_node *node)
+{
+	/**
+	** No call to binder_inc_node() is needed since we 
+	** don't need to inform userspace of any changes to 
+	** tmp_refs
+	**/
+	node->tmp_refs++;
+}
+
+/**
+** binder_inc_node_tmpref() - take a temporary reference on node
+** @node:  node to reference
+**
+** Take reference on node  to prevent the node from being freed 
+** while referenced only by a local variable. The innder lock is 
+** needed to serialize with the node work on the queue (which
+** isn't needed after the node is dead). If the node is dead
+** (node->proc is NULL), use binder_dead_nodes_lock to protect
+** node->tmp_refs against dead-node- only cases where the node 
+** lock cannot be acquired (eg traversing the dead node list to 
+** print nodes)
+**/
+static void binder_inc_node_tmpref(struct binder_node *node)
+{
+	binder_node_lock(node);
+	if(node->proc)
+		binder_inner_proc_lock(node->proc);
+	else
+		spin_lock(&binder_dead_nodes_lock);
+	
+	binder_inc_node_tmpref_ilocked(node);
+	if(node->proc)
+		binder_inner_proc_unlock(node->proc);
+	else 
+		spin_unlock(&binder_dead_nodes_lock);
+	binder_node_unlock(node);
+}
+
+/**
+** binder_dec_node_tmprefs() - remove  a temporary reference on node
+** @node:  node to reference 
+**
+** Release temporyary reference on node taken via binder_inc_node_tmpref()
+**/
+static void binder_dec_node_tmpref(struct binder_node *node)
+{
+	bool free_node;
+	
+	binder_node_inner_lock(node);
+	if(!node->proc)
+		spin_lock(&binder_dead_nodes_lock);
+	node->tmp_refs--;
+	BUG_ON(node->tmp_refs--);
+	if(!node->proc)
+		spin_unlock(&binder_dead_nodes_lock);
+	
+	/** 
+	** Call binder_dec_node() to check if all refcounts are 0
+	** and cleanup is needed. Calling with strong = 0 and internal = 0
+	** causes no actual reference to be released in binder_dec_node().
+	** If that change, a change is needed here too.
+	**/
+	free_node = binder_dec_node_nilocked(node, 0,1 );
+	binder_node_inner_unlock(node);
+	if(free_node)
+		binder_free_node(node);
+}
+
+
+static void binder_put_node(struct binder_node *node)
+{
+	binder_dec_node_tmpref(node);
+}
+static struct binder_ref * binder_get_ref_olocked(struct binner_proc *proc,
+						u32 desc, bool need_strong_ref)
+{
+	struct rb_node * n = proc->refs_by_desc.rb_node;
+	struct binder_ref *ref;
+	
+	while(n) {
+		ref = rb_entry(n, struct binder_ref, rb_node_desc);
+		
+		if(desc < ref->data.desc) {
+			n  = n->rb_left;
+		} else if ( desc > ref->data.desc) {
+			n = n->rb_right;
+		} else if (need_strong_ref && !ref->data.strong) {
+			binder_user_error("tried to use weak ref as strong ref\n");
+			return NULL;
+		} else {
+			return ref;
+		}
+	}
+	
+	return NULL;
+}
+
+/**
+** binder_get_ref_for_node_olocked() - get the ref associated with given node
+** @proc: binder_proc that owns the ref 
+** @node: binder_node of target
+** @new_ref: newly allocated binder_ref to be initialized or %NULL
+**
+** Lock up the ref for the given node and return it if it exist.
+**
+** If it doesn't exist and the caller provides a newly allocated
+** ref, initialize the  fields of the newly allocated ref and insert 
+** into the given proc rb_trees and node refs list.
+**
+** Return: the ref for node. It is possible that another thread
+**         allocated/initialized the ref first in which case the 
+**         returned ref would be different than the passed-in 
+**         new_ref. new_ref must be kfree'd by the caller in 
+**         this case.
+**/
+static struct binder_ref * binder_get_ref_for_node_olocked(
+					struct binder_proc *proc,
+					struct binder_node *node,
+					struct binder_ref *new_ref)
+{
+	struct binder_context *context = proc->context;
+	struct rb_node **p = &proc->refs_by_node.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_ref *ref;
+	struct rb_node *n;
+	
+	while(*p){
+		parent = *p;
+		ref = rb_entry(parent, struct binder_ref, rb_node_node);
+		
+		if(node < ref->node)
+			p = &(*p)->rb_left;
+		else(node > ref->node)
+			p = &(*p)->rb_right;
+		else
+			return ref;
+	}
+	if(!new_ref)
+		return NULL;
+	
+	binder_stats_created(BINDER_STAT_REF);
+	new_ref->data.debug_id = atomic_inc_return(&binder_last_id);
+	new_ref->proc = proc;
+	new_ref->node = node;
+	rb_link_node(&new_ref->rb_node_node,parent,p);
+	rb_insert_color(&new_ref->rb_node_node, &proc->refs_by_node);
+	
+	new_ref->data.desc = (node == context->binder_context_mgr_node) ? 0 : 1;
+	for(n = rb_first(&proc->refs_by_desc); n != NULL; n = rb_next(n)) {
+		ref = rb_entry(n, struct binder_ref, rb_node_desc);
+		if(ref->data.desc > new_ref->data.desc)
+			break;
+		new_ref->data.desc = ref->data.desc + 1;
+	}
+	
+	p = &proc->refs_by_desc.rb_node;
+	while(*p) {
+		parent = *p;
+		ref = rb_entry(parent, struct binder_ref, rb_node_desc);
+		
+		if(new_ref->data.desc < ref->data.desc)
+			p = &(*p)->rb_left;
+		else if(new_ref->data.desc > ref->data.desc)
+			p = &(*p)->rb_right;
+		else
+			BUG();
+	}
+	rb_link_node(&new_ref->rb_node_desc, parent, p);
+	rb_insert_color(&new_ref->rb_node_desc, &proc->refs_by_desc);
+	
+	binder_node_lock(node);
+	hlist_add_head(&new_ref->node_entry, &node->refs);
+	
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		"%d new ref %d desc %d for node %d\n",
+		proc->pid, new_ref->data.debug_id, new_ref->data.desc,
+		node->debug_id);
+	binder_node_unlock(node);
+	return new_ref;
+}
 
 
 
