@@ -1476,8 +1476,468 @@ static struct binder_ref * binder_get_ref_for_node_olocked(
 	return new_ref;
 }
 
+static void binder_cleanup_ref_olocked(struct binder_ref *ref)
+{
+	bool delete_node = false;
+	
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		"%d delete ref %d desc %d for node %d\n",
+		ref->proc->pid, ref->data.debug_id, ref->data.desc,
+		ref->node->debug_id);
+	rb_erase(&ref->rb_node_desc, &ref->proc->refs_by_desc);
+	rb_erase(&ref->rb_node_node, &ref->proc->refs_by_node);
+	
+	binder_node_inner_lock(ref->node);
+	if(ref->data.strong)
+		binder_dec_node_nilocked(ref->node, 1,1);
+	
+	hlist-del(&ref->node_entry);
+	delete_node = binder_dec_node_nilocked(ref->node, 0, 1);
+	binder_node_inner_unlock(ref->node);
+	
+	/**
+	** Clear ref->node unless we want the caller to free the node 
+	**/
+	if(!delete_node) {
+		/** 
+		** The caller uses ref->node to determine
+		** whether the node needs to be freed. Clear
+		** it since the node is still aliave.
+		**/
+		ref->node = NULL;
+	}
+	
+	if(ref->death) {
+		binder_debug(BINDER_DEBUG_DEAD_BINDER,
+			"%d delete ref %d desc %d has death notification\n",
+			ref->proc->pid, ref->data.debug_id,
+			ref->data.desc);
+		binder_dequeue_work(ref->proc, &ref->death->work);
+		binder_stats_deleted(BINDER_STAT_DEATH);
+	}
+	binder_stats_deleted(BINDER_STAT_REF);
+}
+
+/**
+** binder_inc_ref_olocked() - increment the ref for given handle
+** @ref: ref to be incremented
+** @strong: if true, strong increment, else weak
+** @target_list: list to queue node work on 
+**
+** Increment the ref. @ref->proc->outer_lock must be held on entry
+**
+** Return 0, if successful, else errno
+**/
+static int binder_inc_ref_olocked(struct binder_ref *ref, int strong,
+					struct list_head *target_list)
+{
+	int ret;
+	
+	if(strong) {
+		if(ref->data.string == 0) {
+			ret = binder_inc_node(ref->node, 1, 1, target_list);
+			if(ret)
+				return ret;
+		}
+		ref->data.strong++;
+	} else {
+		if(ref->data.weak == 0) {
+			ret = binder_inc_node(ref->node, 0, 1, target_list);
+			if(ret)
+				return ret;
+		}
+		ref->data.weak++;
+	}
+	
+	return 0;
+}
+
+/**
+** binder_dec_ref() - dec the ref for given handle
+** @ref: ref to be decremented
+** @strong: if true, strong decrement, else weak
+** 
+** Decrement the ref.
+**
+** Return: true if ref is cleaned  up and ready to be freed
+**/
+static bool binder_dec_ref_olocked(struct binder_ref *ref, int strong)
+{
+	if(strong) {
+		if(ref->data.strong == 0) {
+			binder_user_error("%d invalid dec strong, ref %d desc %d s %d w %d\n",
+				ref->proc->pid, ref->data.debug_id,
+				ref->data.desc, ref->data.strong,
+				ref->data.weak);
+			return false;
+		}
+		ref->data.strong--;
+		if(ref->data.strong == 0)
+			binder_dec_node(ref->node, strong, 1);
+	} else {
+		if(ref->data.weak == 0) {
+			binder_user_error("%d invalid dec weak ,ref %d desc %d s %d w %d\n",
+				ref->proc->pid, ref->data.debug_id,
+				ref->data.desc, ref->data.strong,
+				ref->data.weak);
+			return false;
+		}
+		ref->data.weak--;
+	}
+	
+	if(ref->data.strong == 0 && ref->data.weak == 0) {
+		binder_cleanup_ref_olocked(ref);
+		return true;
+	}
+	return false;
+}
 
 
+
+/**
+** binder_get_node_from_ref() - get the node from the given proc/desc 
+** @proc: proc containing the ref
+** @desc: the handle associated with the ref 
+** @need_strong_ref: if true, only return node if refs is strong 
+** @rdata: the id/refcount data for the ref 
+**
+** Given a proc and ref handle, return the associated binder_node
+**
+** Return: a binder_node or NULL if not found or not strong when strong require
+**/
+static struct binder_node *binder_get_node_from_ref(
+					struct binder_proc *proc,
+					u32 desc, bool need_strong_ref,
+					struct binder_ref_data *rdata)
+{
+	struct binder_node *node;
+	struct binder_ref *ref;
+	
+	binder_proc_lock(proc);
+	ref = binder_get_ref_olocked(proc, desc, need_strong_ref);
+	if(!ref)
+		goto err_no_ref;
+	node = ref->node;
+	
+	/**
+	** Take an implicit reference on the node to ensure
+	** it stays alive until the call to binder_put_node()
+	**/
+	binder_inc_node_tmpref(node);
+	if(rdata)
+		*rdata = ref->data;
+	binder_proc_unlock(proc);
+	
+	return node;
+err_no_ref:
+	binder_proc_unlock(proc);
+	return NULL;
+}
+
+/**
+** binder_free_ref() - free the binder_ref 
+** @ref: ref to free
+**
+** Free the binder_ref. Free the binder_node indicated by ref->node 
+** (if non-NULL) and the binder_ref_death indicated by ref->dead.
+**/
+static void  binder_free_ref(struct binder_ref *ref)
+{
+	if(ref->node)
+		binder_free_node(ref->node);
+	kfree(ref->death);
+	kfree(ref);
+}
+
+/**
+** binder_update_ref_for_handle() - inc/dec the ref for given handle
+** @proc: proc containing the ref 
+** @desc: the handle associated with the ref 
+** @increment: true=inc reference, false = dec reference
+** @strong: true= strong reference, false = weak reference
+** @rdata: the id/ refcount data for the ref 
+**
+** Given a proc and ref handle, increment or descriptor the ref 
+** according to "increment" arg.
+**
+** Return: 0 if successful, else errno.
+**/
+static int binder_update_ref_for_handle(struct binder_proc *proc,
+				uint32_t desc, bool increment, bool strong,
+				struct binder_ref_data *rdata)
+{
+	int ret = 0;
+	struct binder_ref *ref;
+	bool delete_ref = false;
+	
+	binder_proc_lock(proc);
+	ret = binder_get_ref_olocked(proc, desc, strong);
+	if(!ref) {
+		ret = -EINVAL;
+		goto err_no_ref;
+	}
+	if(increment)
+		ret = binder_inc_ref_olocked(ref, strong, NULL);
+	else 
+		delete_ref = binder_dec_ref_olocked(ref, strong);
+	
+	if(rdata)
+		*rdata = ref->data;
+	binder_proc_unlock(proc);
+	
+	if(delete_node)
+		binder_free_ref(ref);
+	return ret;
+	
+err_no_ref:
+	binder_proc_unlock(proc);
+	return ret;
+}
+
+/**
+** binder_dec_ref_for_handle() - dec the ref for given handle
+** @proc: proc containing the ref 
+** @desc: the handle associated with the ref 
+** @strong: true=strong reference, false=weak reference
+** @rdata: the id/ refcount data for the ref 
+**
+** Just calls binder_update_ref_for_handle() to decrement the ref.
+**
+** Return: 0 if successful, else errno
+**/
+static int binder_dec_ref_for_handle(struct binder_proc *proc,
+				uint32_t desc, bool strong, struct binder_ref_data *rdata)
+{
+	return binder_update_ref_for_handle(proc, desc, false, strong,rdata);
+}
+
+/**
+** binder_inc_ref_for_node() - increment the ref for given proc/node 
+** @proc: proc containing the ref 
+** @node: target node 
+** @strong: true=strong reference, false = weak reference
+** @target_list: worklist to use if node is incremented
+** @rdata: the id/ refcount data for the ref 
+**
+** Given a proc and node, increment the ref. Create the ref if it 
+** doesn't already exist
+**
+** Return:0 if successful, else errno
+**/
+static int binder_inc_ref_for_node(struct binder_proc *proc,
+				struct binder_node *node,
+				bool strong,
+				struct list_head *target_list,
+				struct binder_ref_data *rdata)
+{
+	struct binder_ref *ref;
+	struct binder_ref *new_ref = NULL;
+	int ret = 0;
+	
+	binder_proc_lock(proc);
+	ref = binder_get_ref_for_node_olocked(proc, node, NULL)
+	if(!ref) {
+		binder_proc_unlock(proc);
+		new_ref = kzalloc(sizeof(*ref), GFP_KERNEL);
+		if(!new_ref)
+			return -ENOMEM;
+		binder_proc_lock(proc);
+		ref = binder_get_ref_for_node_olocked(proc, node, new_ref);
+	}
+	ret = binder_inc_ref_olocked(ref, strong, target_list);
+	*rdata = ref->data;
+	binder_proc_unlock(proc);
+	if(new_ref && ref != new_ref)
+		/** 
+	** Another thread created the ref first so free the one we allocated
+	**/
+		kfree(new_ref);
+	return ret;
+}
+
+static void binder_pop_transaction_ilocked(struct binder_thread *target_thread,
+				struct binder_transaction *t)
+{
+	BUG_ON(!target_thread);
+	assert_spin_locked(&target_thread->proc->inner_lock);
+	BUG_ON(target_thread->transaction_stack != t);
+	BUG_ON(target_thread->transaction_stack->from != target_thread);
+	target_thread->transaction_stack = 
+		target_thread->transaction_stack->from_parent;
+	t->from = NULL;
+}
+
+/**
+** binder_thread_dec_tmpref() - decrement thread->tmp_ref
+** @thread: thread to decrement
+**
+** A thread needs to be kept alive while being used to create or 
+** handle a transaction. binder_get_txn_from() is used to safely 
+** extract t->from from a binder_transaction and keep the thread 
+** indicated by t->from from being freed. When done with that 
+** binder_thread, this function is called to decrement the 
+** tmp_ref and free if appropriate (thread has been released
+** and no transaction being processed by the driver)
+**/
+static void binder_thread_dec_tmpref(struct binder_thread *thread)
+{
+	/**
+	** atomic is used to protect the counter value while 
+	** it cannot reach zeroed or thread->is_dead is false
+	**/
+	binder_inner_proc_lock(thread->proc);
+	atomic_dec(&thread->tmp_ref);
+	if(thread->is_dead && !atomic_read(&thread->tmp_ref)) {
+		binder_inner_proc_unlock(thread->proc);
+		binder_free_thread(thread);
+		return;
+	}
+	binder_inner_proc_unlock(thread->proc);
+	
+}
+
+/**
+** binder_proc_dec_tmpref() - decrement proc->tmp_ref
+** @proc: proc to decrement
+** 
+** A binder_proc needs to be kept alive while being used to create or 
+** handle a transaction. proc->tmp_ref is incremented when 
+** creating a new transaction or the binder_proc is currently in-use 
+** by threads that are being released. When done with the binder_proc,
+** this function is called to decrement the counter and free the 
+** proc if appropriate(proc has been released, all threads have 
+** been released and not currently in- use to process a transaction).
+**/
+static void binder_proc_dec_tmpref(struct binder_proc *proc)
+{
+	binder_inner_proc_lock(proc);
+	proc->tmp_ref--;
+	if(proc->is_dead && RB_EMPTY_ROOT(&proc->threads) && 
+		!proc->tmp_ref) {
+		binder_inner_proc_unlock(proc);
+		binder_free_proc(proc);
+		return;
+	}
+	binder_inner_proc_unlock(proc);
+}
+
+/**
+** binder_get_txn_from() - safely extract the "from" thread in transaction
+** @t: binder transaction for t->from
+**
+** Atomically return the "from" thread and increment the tmp_ref
+** count for the thread to ensure it stays alive until
+** binder_thread_dec_tmpref() is called.
+**
+** Return: the value of t->from
+**/
+static struct binder_thread *binder_get_txn_from(
+		struct binder_transaction *t)
+{
+	struct binder_thread *from;
+	
+	spin_lock(&t->lock);
+	from = t->from;
+	if(from)
+		atomic_inc(&from->tmp_ref);
+	spin_unlock(&t->lock);
+	return from;
+}
+
+/** 
+** binder_get_txn_from_and_acq_inner() = get t->from and acquire inner lock 
+** @t: binder transaction for t->from 
+** 
+** Same as binder_get_txn_from() exce[t it also acquires the proc->inner_lock
+** to guarantee that the thread cannot be released while operating on it. 
+** The caller must call binder_inner_proc_unlock() to release the inner lock 
+** as well as call binder_dec_thread_txn() to release the reference.
+**
+** Return: the value of t->from 
+**/
+static struct binder_thread *binder_get_txn_from_and_acq_inner(
+			struct binder_transaction *t)
+{
+	struct binder_thread *from;
+	
+	from = binder_get_txn_from(t);
+	if(!from)
+		return NULL;
+	binder_inner_proc_lock(from->proc);
+	if(t->from) {
+		BUG_ON(from != t->from);
+		return from;
+	}
+	binder_inner_proc_unlock(from->proc);
+	binder_thread_dec_tmpref(from);
+	return NULL;
+}
+
+static void binder_free_transaction(struct binder_transaction *t)
+{
+	if(t->buffer)
+		t->buffer->transaction = NULL;
+	kfree(t);
+	binder_stats_deleted(BINDER_STAT_TRANSACTION);
+}
+
+static void binder_send_failed_reply(struct binder_transaction *t,
+				uint32_t error_code)
+{
+	struct binder_thread *target_thread;
+	struct binder_transaction *next;
+	
+	BUG_ON(t->flags & TF_ONE_WAY);
+	while(1) {
+		target_thread = binder_get_txn_from_and_acq_inner(t);
+		if(target_thread) {
+			binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
+				"send failed reply for transaction %d to %d: %d\n",
+				t->debug_id, 
+				target_thread->proc->pid,
+				target_thread->pid);
+			binder_pop_transaction_ilocked(target_thread, t);
+			if(target_thread->reply_error.cmd == BR_OK) {
+				target_thread->reply_error.cmd = error_code;
+				binder_enqueue_work_ilocked(
+					&target_thread->reply_error.work,
+					&target_thread->todo);
+				wake_up_interruptible(&target_thread->wait);
+			} else {
+				WARN(1, "Unexpected reply error:%u\n",
+					target_thread->reply_error.cmd);
+			}
+			binder_inner_proc_unlock(target_thread->proc);
+			binder_thread_dec_tmpref(target_thread);
+			binder_free_transaction(t);
+			return;
+		}
+		next = t->from_parent;
+		binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
+			"send failed reply for transaction %d, target dead\n",
+			t->debug_id);
+		binder_free_transaction(t);
+		if(next == NULL) {
+			binder_debug(BINDER_DEBUG_DEAD_BINDER,
+				"reply failed, no target thread at root\n");
+			return;
+		}
+		t = next;
+		binder_debug(BINDER_DEBUG_DEAD_BINDER,
+			"reply failed, no target thread -- retry %d\n",
+			t->debug_id);
+	}
+}
+
+/**
+** binder_validata_object() - checks for a valid metadata object in a buffer.
+** @buffer: binder_buffer that we're parsing.
+** @offset: offset in the buffer at which to validate an object.
+**
+** Return: If there's a valid metadata object at @offset in @buffer, the
+**         size of that object. Otherwise, it returns zero.
+**/
+static size_t binder_validata_object(struct binder_buffer *buffer, u64 offset)
 
 
 
