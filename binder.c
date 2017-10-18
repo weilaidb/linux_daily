@@ -1938,6 +1938,104 @@ static void binder_send_failed_reply(struct binder_transaction *t,
 **         size of that object. Otherwise, it returns zero.
 **/
 static size_t binder_validata_object(struct binder_buffer *buffer, u64 offset)
+{
+	/** Check if we can read a header first **/
+	struct binder_object_header *hdr;
+	size_t object_size = 0;
+	
+	if(offset > buffer->data_size - sizeof(*hdr) ||
+		buffer-> data_size < sizeof(*hdr) ||
+		! IS_ALIGNED(offset, sizeof(u32)))
+		return 0;
+	/** OK, now see if we can read a complete object. **/
+	hdr = (struct binder_object_header *)(buffer->data + offset);
+	switch(hdr->type) {
+	case BINDER_TYPE_BINDER:
+	case BINDER_TYPE_WEAK_BINDER:
+	case BINDER_TYPE_HANDLE:
+	case BINDER_TYPE_WEAK_HANDLE:
+		object_size = sizeof(struct flat_binder_object);
+		break;
+	case BINDER_TYPE_FD:
+		object_size = sizeof(struct binder_fd_object);
+		break;
+	case BINDER_TYPE_PTR:
+		object_size = sizeof(struct binder_buffer_object);
+		break;
+	case BINDER_TYPE_FDA:
+		object_size = sizeof(struct binder_fd_array_object);
+		break;
+	default:
+		return 0;
+	}
+	
+	if(offset <= buffer->data_size - object_size &&
+		buffer->data_size >= object_size)
+		return object_size;
+		else
+			return 0;
+}
+
+/**
+** binder_validate_ptr() - validates binder_buffer_object in a binder_buffer.
+** @b: binder_buffer containing the object
+** @index: index in offset array at which the binder_buffer_object is  locked.
+** @start: points to the start of the offset array
+** @num_valid: the number of valid offsets in the offset array
+** 
+** Return: If @index is within the valid range of the offset array 
+**         described by @start and @num_valid, and if there's a valid
+**         binder_buffer_object at the offset found in index @index
+**         of the offset array, that object is returned. Otherwise,
+**         %NULL is returned.
+**         Note that the offset found in index @index itself if not 
+**         verified; this function assumes that @num_valid elements
+**         from @start were previously verified to have valid offsets.
+**/
+static struct binder_buffer_object * binder_validate_ptr(struct binder_buffer *b,
+										binder_size_t index,
+										binder_size_t *start,
+										binder_size_t num_valid)
+{
+	struct binder_buffer_object *buffer_obj;
+	binder_size_t *offp;
+	
+	if(index >= num_valid)
+		return NULL;
+	
+	offp = start + index;
+	buffer_obj = (struct binder_buffer_object *) (b->data + *offp);
+	if(buffer_obj->hdr.type != BINDER_TYPE_PTR)
+		return NULL;
+	
+	return buffer_obj;
+}
+
+/**
+** binder_validate_fixup() - validates pointer/ fd fixups happen in order.
+** @b:   transaction buffer
+** @objects_start:   start of objects buffer
+** @buffer:   binder_buffer_object in which to fix up 
+** @offset: start offset in @buffer to fix up 
+** @last_obj: last binder_buffer_object that we fixed up in 
+** @last_mim_offset: minimum fixup offset in @last_obj.
+**
+** Return: %true if a fixup in buffer @buffer at offset @offset is allowed.
+**
+* For safety readsons, we only allow fixups inside a buffer to happen
+** at increasing offset; additionally , we only allow fixup on the last 
+** buffer object that was verified, or one of its parents.
+**
+** Example of what is allowed:
+**
+** A 
+**   B(parent = A, offset = 0)
+**   C(parent = A, offset = 16)
+**     D(parent = C, offset = 0)
+**   E(parent = A, offset = 32) // min_offset is 16(C.parent_offset)
+**
+** Examples of what is not allowed:
+
 
 
 

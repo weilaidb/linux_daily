@@ -1,0 +1,198 @@
+Python Module Index
+-
+__builtin__  The module that provides the built-in namespace 
+__future__    Future statement definitions
+__main__   The environment where the top-level script in run.
+_winreg(Windows) Routines and objects for manipulating the Windows registry.
+
+a
+abc   Abstract base classes according to PEP 3119
+aifc  Read and write audio files in AIFF or AIFC format.
+anydbm    Generic interface to DBM-style database modules.
+argparse  Command-line option and argument parsing library.
+array     Space efficient arrays of uniformly typed numeric values.
+ast       Abstract Syntax Tree classes and manipulation.
+asynchat  Support for asynchronous command/response protocols.
+asynccore A base class for developing asynchronous socket handling services.
+atexit    Register and execute cleanup functions.
+audioop   Manipulate raw audio data.
+
+B
+base64   RF 3548:Base 16, Base 32,Base64 Data Encodings
+BaseHttpServer   Base HTTP server (base class for SimpleHTTPServer and CGIHTTPServer).
+Bastion          Deprcated:Providing restricted acess to objects.
+bdb              Deugger framework
+binaascii        Tools for coverting between binary and various ASCII-encoded binary representations
+binhex           Encode and decode files in binhex4 format.
+bisect           Array bisection algorithms for binary searching.
+bsdbd            Interface to Berkeley DB databse library
+bz2              Interface to compression and decompression routinue compatible with bzip2.
+
+C
+calendar         Functions for working with calendars,including some emulation of the Unix cal program.
+Carbon        
+cd(IRIX)         Deprecated: Interface to the CD-ROM on Silicon Graphics systems.
+cgi              Helpers for running Python scripts via the Common Gateway Interface.
+CGIHTTPServer    This module provides a requeset handler for HTTP servers which can run CGI scripts.
+cgitb            Configurable traceback handler for CGI scripts.
+chunk Module to read IFF chunks.
+cmath           Mathematical functions for complex numbers.
+cmd             Build line-oriented command interpreters.
+code            Facilities to implement read-eval-print loops.
+codecs          Eoncode and decode data and streams.
+codeop          Compile(possibly imcomplete) Python code.
+collections      High-performace datatypes
+ColorPicker     Deprecated:Interface to the standard color selection dialog.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
