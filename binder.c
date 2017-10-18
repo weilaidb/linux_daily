@@ -2035,7 +2035,242 @@ static struct binder_buffer_object * binder_validate_ptr(struct binder_buffer *b
 **   E(parent = A, offset = 32) // min_offset is 16(C.parent_offset)
 **
 ** Examples of what is not allowed:
+**
+** Decreasing offsets within the same parent:
+** A
+**    C(parent = A, offset = 16)
+**    B(parent = A, offset = 0) // decreasing offset within A 
+**
+** Referring to a parent that wasn't the last object or any of its parents:
+** A 
+**     B(parent = A, offset = 0)
+**     C(parent = A, offset = 0)
+**     C(parent = A, offset = 16)
+**       D(parent = B, offset = 0) // B is not A or any of A's parents
+**/
+static bool binder_validate_fixup(struct binder_buffer *b,
+					binder_size_t *objects_start,
+					struct binder_buffer_object *buffer,
+					binder_size_t fixup_offset,
+					struct binder_buffer_object *last_obj,
+					binder_size_t last_min_offset)
+{
+	if(!last_obj) {
+		/** Nothing to fix up in **/
+		return false;
+	}
+	
+	while( last_obj != buffer) {
+		/**
+		** Safe to retrieve the parent of last_obj, since it 
+		** was already previously verified by the driver.
+		**/
+		if((last_obj->flags & BINDER_BUFFER_FLAG_HAS_PARENT) == 0)
+			return false;
+		last_min_offset = last_obj->parent_offset + sizeof(uintptr_t);
+		last_obj = (struct binder_buffer_object *)
+				(b->data + *(objects_start + last_obj->parent));
+	}
+	return (fixup_offset >= last_min_offset);
+}
 
+static void binder_transaction_buffer_release(struct binder_proc *proc,
+						struct binder_buffer *buffer,
+						binder_size_t *failed_at)
+{
+	binder_size_t *offp, *off_start, *off_end;
+	int debug_id = buffer->debug_id;
+	
+	binder_debug(BINDER_DEBUG_TRANSACTION,
+		"%d buffer release %d, size %zd-%zd, failed at %p\n",
+		proc->pid, buffer->debug_id,
+		buffer->data_size, buffer->offsets_size, failed_at);
+	
+	if(buffer->target_node)
+		binder_dec_node(buffer->target_node, 1, 0);
+	
+	off_start = (binder_size_t *)(buffer->data + 
+					ALIGN(buffer->data_size , sizeof(void *)));
+					
+	if(failed_at)
+		off_end = failed_at;
+	else
+		off_end = (void *)off_start + buffer->offsets_size;
+	
+	for(offp = off_start; offp < off_end; offp++) {
+		struct binder_object_header *hdr;
+		size_t object_size = binder_validate_object(buffer, *offp);
+		
+		if(object_size == 0) {
+			pr_err("transaction release %d bad object at offset %lld, size %zd\n",
+				debug_id, (u64)*offp, buffer->data_size);
+			continue;
+			
+		}
+		hdr = (struct binder_object_header *)(buffer->data + *offp);
+		switch(hdr->type) {
+		case BINDER_TYPE_BINDER:
+		case BINDER_TYPE_WEAK_BINDER: {
+			struct flat_binder_object *p;
+			struct binder_node *node;
+			
+			fp = to_flat_binder_object(hdr);
+			node = binder_get_node(proc, fp->binder);
+			if(node == NULL) {
+				pr_err("transaction release %d bad node %016llx\n",
+					debug_id, (u64)fp->binder);
+				break;
+			}
+			binder_debug(BINDER_DEBUG_TRANSACTION,
+				"   node %d u %016llx\n",
+				node->debug_id, (u64)node->ptr);
+			binder_dec_node(node, hdr->type == BINDER_TYPE_BINDER,
+				0);
+			binder_put_node(node);
+		}break;
+		case BINDER_TYPE_HANDLE:
+		case BINDER_TYPE_WEAK_HANDLE: {
+			struct flat_binder_object *fp;
+			struct binder_ref_data rdata;
+			int ret;
+			
+			fp = to_flat_binder_object(hdr);
+			ret = binder_dec_ref_for_handle(proc, fp->handle,
+						hdr->type == BINDER_TYPE_HANDLE, &rdata);
+			if(ret) {
+				pr_err("transaction release %d bad handle %d, ret = %d\n",
+					debug_id, fp->handle, ret);
+				break;
+			}
+			binder_debug(BINDER_DEBUG_TRANSACTION,
+				"   ref %d desc %d\n",
+				rdata.debug_id, rdata.desc);
+		}break;
+		
+		case BINDER_TYPE_FD: {
+			struct binder_fd_object *fp  = to_binder_fd_object(hdr);
+			
+			binder_debug(BINDER_DEBUG_TRANSACTION,
+				"     fd %d\n", fp->fd);
+			if(failed_at)
+				task_close_fd(proc, fd->fd);
+			
+		}break;
+		
+		case BINDER_TYPE_PTR:
+			/**
+			** Nothing to do here, this will get cleaned up when the 
+			** transaction buffer gets freed
+			**/
+			break;
+		case BINDER_TYPE_FDA: {
+			struct binder_fd_array_object *fda;
+			struct binder_buffer_object *parent;
+			uintptr_t parent_buffer;
+			u32 *fd_array;
+			size_t fd_index;
+			binder_size_t fd_buf_size;
+			
+			fda = to_binder_fd_array_object(hdr);
+			parent = binder_validate_ptr(buffer, fda->parent,
+							off_start,
+							offp - off_start);
+			if(!parent) {
+				pr_err("transaction release %d bad parent offset",
+						debug_id);
+				continue;
+			}
+			/**
+			** Since the parent was already fixed up, convert it 
+			** back to kernel address space to access it 
+			**/
+			parent_buffer = parent->buffer - 
+						binder_alloc_get_user_buffer_offset(
+						&proc->alloc);
+			
+			fd_buf_size = sizeof(u32) *fda->num_fds;
+			if(fda->num_fds >= SIZE_MAX / sizeof(u32)) {
+				pr_err("transaction release %d invalid number of fds(%lld)\n",
+					debug_id, (u64)fda->num_fds);
+				continue;
+			}
+			if(fd_buf_size > parent->length ||
+				fda->parent_offset > parent->length - fd_buf_size) {
+				/** No space for all file descriptors here. **/
+				pr_err("transaction release %d not enough space for %lld fds in buffer\n",
+					debug_id, (u64)fda->num_fds);
+				continue;
+			}
+			fd_array = (u32 *)(parent_buffer + fda->parent_offset);
+			for(fd_index = 0; fd_index < fda->num_fds; fd_index++)
+				task_close_fd(proc, fd_array[fd_index]);
+			
+		}break;
+		
+		default:
+			pr_err("transaction release %d bad object type %x\n",
+				debug_id, hdr->type);
+			break;
+		}
+		
+	}
+}
+
+static int binder_translate_binder(struct flat_binder_object *fp,
+				struct binder_transaction *t,
+				struct binder_thread *thread)
+{
+	struct binder_node *node;
+	struct binder_proc *proc = thread->proc;
+	struct binder_proc *target_proc = t->to_proc;
+	struct binder_ref_data rdata;
+	int ret = 0;
+	
+	node = binder_get_node(proc, fp->binder);
+	if(!node) {
+		node = binder_new_node(proc, fp);
+		if(!node)
+			return -ENOMEM;
+	}
+	if(fp->cookie != node->cookie) {
+		binder_user_error("%d: %d sending u%016llx node %d, cookie mismatch %016llx != %016llx\n",
+				proc->pid, thread->pid, (u64)fp->binder,
+				node->debug_id, (u64)fp->cookie,
+				(u64)node->cookie);
+		ret = -EINVAL;
+		goto done;
+	}
+	if(security_binder_transfer_binder(proc->tsk, target_proc->tsk)) {
+		ret = -EPERM;
+		goto done;
+	}
+	
+	ret  = binder_inc_ref_for_node(target_proc, node,
+					fp->hdr.type == BINDER_TYPE_BINDER,
+					&thread->todo, &rdata);
+	if(ret)
+		goto done;
+	
+	if(fp->hdr.type == BINDER_TYPE_BINDER)
+		fp->hdr.type = BINDER_TYPE_HANDLE;
+	else 
+		fp->hdr.type = BINDER_TYPE_WEAK_HANDLE;
+	
+	fp->binder = 0;
+	fp->handle = rdata.desc;
+	fp->cookie = 0;
+	
+	trace_binder_transaction_node_to_ref(t, node, &rdata);
+	binder_debug(BINDER_DEBUG_TRANSACTION,
+		"    node %d u%016llx -> ref %d desc %d\n",
+		node->debug_id, (u64)node->ptr,
+		rdata.debug_id, rdata.desc);
+
+done:
+	binder_put_node(proc);
+	return ret;
+	
+}
 
 
 
