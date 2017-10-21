@@ -2475,7 +2475,344 @@ err_translate_fd_failed:
 }
 
 static int binder_fixup_parent(struct binder_transaction *t,
+			struct binder_thread *thread,
+			struct binder_buffer_object *bp,
+			binder_size_t *off_start,
+			binder_size_t num_valid,
+			struct binder_buffer_object *last_fixup_obj,
+			binder_size_t last_fixup_min_off)
+{
+	struct binder_buffer_object *parent;
+	u8 *parent_buffer;
+	struct binder_buffer *b = t->buffer;
+	struct binder_proc *proc = thread->proc;
+	struct binder_proc *target_proc = t->to_proc;
+	
+	if(!(bp->flags & BINDER_BUFFER_FLAG_HAS_PARENT))
+		return 0;
+	
+	parent = binder_validate_ptr(b, bp->parent, off_start, num_valid);
+	if(!parent) {
+		binder_user_error("%d: %d got transaction with invalid parent offset or type\n",
+				proc->pid, thread->pid);
+		return -EINVAL;
+	}
+	
+	if(!binder_validate_fixup(b, off_start,
+					parent, bp->parent_offset,
+					last_fixup_obj,
+					last_fixup_min_off)) {
+		binder_user_error("%d: %d got transaction with out-of-order buffer fixup\n",
+			proc->pid, thread->pid);
+		return -EINVAL;
+	}
+	
+	if(parent->length < sizeof(binder_uintptr_t) ||
+		bp->parent_offset > parent->length - sizeof(binder_uintptr_t)) {
+		/** No space for a pointer here ! */
+		binder_user_error("%d:%d got transaction with invalid parent offset\n",
+			proc->pid, thread->pid);
+		return -EINVAL;
+	}
+	parent_buffer = (u8 *)(parent->buffer - 
+				binder_alloc_get_user_buffer_offset(
+					&target_proc->alloc));
+	*(binder_uintptr_t *)(parent_buffer + bp->parent_offset) = bp->buffer;
+	
+	return 0;
+}
+
+/**
+** binder_proc_transaction() - sends a transaction to a process and wakes it up 
+** @t:          transaction to send
+** @proc: process to send the transaction to 
+** @thread: thread in @proc to send the transaction to (may be NULL)
+**
+** This function queues a transaction to the specified process. It will try
+** to find a thread in the target process to handle the transaction and 
+** wake it up. If no thread is found, the work is queued to the proc
+** waitqueue.
+**
+** If the @thread parameter is not NULL, the transaction is always queued 
+** to the waitlist of the specific thread.
+**
+** Return: true if the transactions was successfully queued
+**         false if the target process thread is dead
+**/
+static bool binder_proc_transaction(struct binder_transaction *t,
+				struct binder_proc *proc,
+				struct binder_thread *thread)
+{
+	struct list_head *target_list = NULL;
+	struct binder_node * node = t->buffer->target_node;
+	bool oneway = !!(t->flags & TF_ONE_WAY);
+	bool wakeup = true;
+	
+	BUG_ON(!node);
+	binder_node_lock(node);
+	if(oneway) {
+		BUG_ON(thread);
+		if(node->has_async_transaction) {
+			target_list = &node->async_todo;
+			wakeup = false;
+		} else {
+			node->has_async_transaction = 1;
+		}
+		
+	}
+	
+	binder_inner_proc_lock(proc);
+	
+	if(proc->is_dead || (thread && thread->is_dead)) {
+		binder_inner_proc_unlock(proc);
+		binder_node_unlock(node);
+		return false;
+	}
+	
+	if(!thread && !target_list) 
+		thread = binder_select_thread_ilock(proc);
+	
+	if(thread)
+		target_list = &thread->todo;
+	else if(!target_list)
+		target_list = &proc->todo;
+	else
+		BUG_ON(target_list != &node->async_todo);
+	
+	binder_enqueue_work_ilocked(&t->work, target_list);
+	
+	if(wakeup)
+		binder_wakeup_thread_ilocked(proc, thread, !oneway /** sync **/);
+	
+	binder_inner_proc_unlock(proc);
+	binder_node_unlock(node);
+	
+	return true;
+}
+
+static void  binder_transaction(struct binder_proc *proc,
+				struct binder_thread *thread,
+				struct binder_transaction_data *tr, int reply,
+				binder_size_t extra_buffers_size)
+{
+	int ret;
+	struct binder_transaction *t;
+	struct binder_work *tcomplete;
+	binder_size_t *offp, *off_end, *off_start;
+	binder_size_t off_min;
+	u8 *sg_bufp, *sg_buf_end;
+	struct binder_proc *target_proc = NULL;
+	struct binder_thread *target_thread = NULL;
+	struct binder_node *target_node = NULL;
+	struct binder_transaction *in_reply_to = NULL;
+	struct binder_transaction_log_entry *e;
+	uint32_t return_error = 0;
+	uint32_t return_error_param = 0;
+	uint32_t return_error_line = 0;
+	struct binder_buffer_object *last_fixup_obj = NULL;
+	binder_size_t last_fixup_min_off = 0;
+	struct binder_context *context = proc->context;
+	int t_debug_id = atomic_inc_return(&binder_last_id);
+	
+	e = binder_transaction_log_add(&binder_transaction_log);
+	e->debug_id = t_debug_id;
+	e->call_type = reply ? 2 : !!(tr->flags & TF_ONE_WAY);
+	e->from_proc = proc->pid;
+	e->from_thread = tr->target.handle;
+	e->target_handle = tr->target.handle;
+	e->data_size = tr->data_size;
+	e->offsets_size = tr->offsets_size;
+	e->context_name = proc->context->name;
+	
+	if(reply) {
+		binder_inner_proc_lock(proc);
+		in_reply_to = thread->transaction_stack;
+		if(in_reply_to == NULL) {
+			binder_inner_proc_unlock(proc);
+			binder_user_error("%d:%d got reply transaction with no transaction  stack\n",
+				proc->pid, thread->pid);
+			return_error = BR_FAILED_REPLY;
+			return_error_param = -EPROTO;
+			return_error_line = __LINE__;
+			goto err_empty_call_stack;
+		}
+		
+		if(in_reply_to->to_thread != thread) {
+			spin_lock(&in_reply_to->lock);
+			binder_user_error("%d:%d got reply transaction with bad transaction stack, transaction %d has target %d:%d\n",
+				proc->pid, thread->pid, in_reply_to->debug_id,
+				in_reply_to->to_proc ?
+				in_reply_to->to_proc->pid : 0,
+				in_reply_to->to_thread ?
+				in_reply_to->to_thread->pid: 0);
+			spin_unlock(&in_reply_to->lock);
+			binder_inner_proc_unlock(proc);
+			return_error = BR_FAILED_REPLY;
+			return_error_param = -EPROTO;
+			return_error_line = __LINE__;
+			in_reply_to = NULL;
+			goto err_bad_call_stack;
+		}
+		thread->transaction_stack = in_reply_to->to_parent;
+		binder_inner_proc_unlock(proc);
+		binder_set_nice(in_reply_to->saved_priority);
+		target_thread = binder_get_txn_from_and_acq_inner(in_reply_to);
+		if(target_thread == NULL) {
+			return_error = BR_DEAD_REPLY;
+			return_error_line = __LINE__;
+			goto err_dead_binder;
+		}
+		if(target_thread->transaction_stack != in_reply_to) {
+			binder_user_error("%d: %d got reply transaction with bad target transaction stack %d, expected %d\n",
+				proc->pid, thread->pid,
+				target_thread->transaction_stack ?
+				target_thread->transaction_stack->debug_id : 0,
+				in_reply_to->debug_id);
+			binder_inner_proc_unlock(target_thread->proc);
+			return_error = BR_FAILED_REPLY;
+			return_error_param = -EPROTO;
+			return_error_line = __LINE__;
+			in_reply_to = NULL;
+			target_thread = NULL;
+			goto err_dead_binder;
+		}
+		target_proc = target_thread->proc;
+		target_proc->tmp_ref++;
+		binder_inner_proc_unlock(target_thread->proc);
+		
+		
+	} else {
+		if(tr->target.handle) {
+			struct binder_ref *ref;
+			/** 
+			** There must already be a strong ref 
+			** on this node, If so, do a strong
+			** increment on the node to ensure it 
+			** stays alive until the transaction is 
+			** done
+			**/
+			binder_proc_lock(proc);
+			ref = binder_get_ref_olocked(proc, tr->target.handle,
+						true);
+			if(ref) {
+				binder_inc_node(ref->node, 1, 0, NULL);
+				target_node = ref->node;
+			}
+			 binder_proc_unlock(proc);
+			 if(target_node == NULL) {
+				 binder_user_error("%d:%d got transaction to invalid handle\n",
+					proc->pid, thread->pid);
+				return_error = BR_FAILED_REPLY;
+				return_error_param = -EINVAL;
+				return_error_line = __LINE__;
+				goto err_invalid_target_handle;
+			 }
+		} else {
+			mutex_lock(&context->context_mgr_node_lock);
+			target_node = context->binder_context_mgr_node;
+			if(target_node == NULL) {
+				return_error = BR_DEAD_REPLY;
+				mutex_unlock(&context->context_mgr_node_lock);
+				return_error_line = __LINE__;
+				goto err_no_context_mgr_node;
+			}
+			binder_inc_node(target_node, 1, 0, NULL);
+			mutex_unlock(&context->context_mgr_node_lock);
 			
+		}
+		e->to_node = target_node->debug_id;
+		binder_node_lock(target_node);
+		target_proc = target_node->proc;
+		if(target_node == NULL) {
+			binder_node_unlock(target_node);
+			return_error = BR_DEAD_REPLY;
+			return_error_line = __LINE__;
+			goto err_dead_binder;
+		}
+		binner_inner_proc_lock(target_proc);
+		target_proc->tmp_ref++;
+		binder_inner_proc_unlock(target_proc);
+		binder_node_unlock(target_node);
+		if(security_binder_transaction(proc->tsk,
+				target_proc->tsk) < 0) {
+			return_error = BR_FAILED_REPLY;
+			return_error_param = -EPERM;
+			return_error_line = __LINE__;
+			goto err_invalid_target_handle;
+		}
+		binder_inner_proc_lock(proc);
+		if(!(tr->flags & TF_ONE_WAY) && thread->transaction_stack) {
+			struct binder_transaction *tmp;
+			
+			tmp = thread->transaction_stack;
+			if(tmp->to_thread != thread) {
+				spin_lock(&tmp->lock);
+				binder_user_error("%d:%d got new transaction with bad transaction stack, transaction %d has target %d:%d\n",
+					proc->pid, thread->pid, tmp->debug_id,
+					tmp->to_proc ? tmp->to_proc->pid: 0,
+					tmp->to_thread ?
+					tmp->to_thread->pid : 0);
+				spin_unlock(&tmp->lock);
+				binder_inner_proc_unlock(proc);
+				return_error = BR_FAILED_REPLY;
+				return_error_param = -EPROTO;
+				return_error_line  = __LINE__;
+				goto err_bad_call_stack;
+			}
+			
+			while(tmp) {
+				struct binder_thread *from;
+				
+				spin_lock(&tmp->lock);
+				from = tmp->from;
+				if(from && from->proc == target_proc) {
+					atomic_inc(&from->tmp_ref);
+					target_thread = from;
+					spin_unlock(&tmp->lock);
+					break;
+				}
+				spin_unlock(&tmp->lock);
+				tmp = tmp->from_parent;
+			}
+		}
+		binder_inner_proc_unlock(proc);
+	}
+	
+	if(target_thread)
+		e->to_thread = target_thread->pid;
+	e->to_proc = target_proc->pid;
+	
+	/** TODO: reuse incomming transaction for reply **/
+	t = kzalloc(sizeof(*t), GFP_KERNEL);
+	if(t == NULL) {
+		return_error = BR_FAILED_REPLY;
+		return_error_param = -ENOMEM;
+		return_error_line = __LINE__;
+		goto err_alloc_failed;
+	}
+	binder_stats_created(BINDER_STAT_TRANSACTION);
+	spin_lock_init(&t->lock);
+	
+	tcomplete = kzalloc(sizeof(*tcomplete), GFP_KERNEL);
+	if(tcomplete == NULL) {
+		return_error = BR_FAILED_REPLY;
+		return_error_param = -ENOMEM;
+		return_error_line = __LINE__;
+		goto err_alloc_tcomplete_failed;
+	}
+	binder_stats_created(BINDER_STAT_TRANSACTION_COMPLETE);
+	
+	t->debug_id = t_debug_id;
+	if(reply) 
+		binder_debug(BINDER_DEBUG_TRANSACTION,
+			"%d:%d BC_REPLY %d->%d: %d, data %d016llx-%016llx size %lld-%lld-%lld\n",
+			proc->pid, thread->pid, t->debug_id,
+			target_proc->pid, target_thread->pid,
+			(u64)tr->data.ptr.buffer,
+			
+	
+}
+
 
 
 
