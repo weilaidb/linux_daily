@@ -2809,7 +2809,100 @@ static void  binder_transaction(struct binder_proc *proc,
 			proc->pid, thread->pid, t->debug_id,
 			target_proc->pid, target_thread->pid,
 			(u64)tr->data.ptr.buffer,
+			(u64)tr->data_size, (u64)tr->offsets_size,
+			(u64)extra_buffers_size);
+	else
+		binder_debug(BINDER_DEBUG_TRANSACTION,
+			"%d:%d BC_TRANSACTION %d-> %d - node %d, data %016llx-%016llx size %lld-%lld-%lld\n",
+			proc->pid, thread->pid, t->debug_id,
+			target_proc->pid, target_node->debug_id,
+			(u64)tr->data.ptr.buffer,
+			(u64)tr->data.ptr.offsets,
+			(u64)tr->data_size, (u64)tr->offsets_size,
+			(u64)extra_buffers_size);
 			
+	if(!reply && !(tr->flags & TF_ONE_WAY))
+		t->from = thread;
+	else
+		t->from = NULL;
+	t->sender_euid = task_euid(proc->tsk);
+	t->to_proc = target_proc;
+	t->to_thread = target_thread;
+	t->code = tr->code;
+	t->flags = tr->flags;
+	t->priority = task_nice(current);
+	
+	trace_binder_transaction(reply, t, target_node);
+	
+	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
+					tr->offsets_size , extra_buffers_size,
+					!reply && (t->flags & TF_ONE_WAY));
+	if(IS_ERR(t->buffer)) {
+		/**
+		** -ESRCH indicates VMA cleared. The target is dying.
+		**/
+		return_error_param = PTR_ERR(t->buffer);
+		return_error_line  = __LINE__;
+		return_error = return_error_param == -ESRCH ?
+			BR_DEAD_REPLY : BR_FAILED_REPLY;
+		t->buffer = NULL;
+		goto err_binder_alloc_buf_failed;
+	}
+	t->buffer->allow_user_free = 0;
+	t->buffer->debug_id = t->debug_id;
+	t->buffer->transaction = t;
+	t->buffer->target_node = target_node;
+	trace_binder_transaction_alloc_buf(t->buffer);
+	off_start = (binder_size_t *)(t->buffer->data + 
+			ALIGN(tr->data_size, sizeof(void *)));
+	offp = off_start;
+	
+	if(copy_from_user(t->buffer->data, (const void __user *)(uintptr_t)
+			tr->data.ptr.buffer, tr->data_size)) {
+		binder_user_error("%d:%d got transaction with invalid data ptr\n",
+				proc->pid, thread->pid);;
+		return_error = BR_FAILED_REPLY;
+		return_error_param  = -EFAULT;
+		return_error_line = __LINE__;
+		goto err_copy_data_failed;
+	}
+	if(copy_from_user(offp, (const void __user *)(uintptr_t)
+				tr->data.ptr.offsets, tr->offsets_size)) {
+		binder_user_error("%d: %d got transaction with invalid offsets ptr\n",
+			proc->pid, thread->pid);
+		return_error = BR_FAILED_REPLY;
+		return_error_param = -EFAULT;
+		return_error_line = __LINE__;
+		goto err_copy_data_failed;
+	}
+	
+	if(!iS_ALIGNED(tr->offsets_size, sizeof(binder_size_t))) {
+		binder_user_error("%d: %d got transaction with invalid offsets size, %lld\n",
+			proc->pid, thread->pid, (u64)tr->offsets_size);
+		return_error = BR_FAILED_REPLY;
+		return_error_param = -EINVAL;
+		return_error_line = __LINE__;
+		goto err_bad_offset;
+	}
+	if(!IS_ALIGNED(extra_buffers_size, sizeof(u64))) {
+		binder_user_error("%d:%d got transaction with unaligned buffers size, %lld\n",
+			proc->pid, thread->pid,
+			(u64)extra_buffers_size);
+		return_error = BR_FAILED_REPLY;
+		return_error_param = -EINVAL;
+		return_error_line = __LINE__;
+		goto err_bad_offset;
+	}
+	
+	off_end = (void *)off_start + tr->offsets_size;
+	sg_bufp = (u8 *) (PTR_ALIGN(off_end, sizeof(void *)));
+	sg_buf_end = sg_bufp + extra_buffers_size;
+	off_min = 0;
+	
+	for(; offp < off_end; offp++) {
+		
+	}
+		
 	
 }
 
