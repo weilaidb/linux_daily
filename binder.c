@@ -3228,9 +3228,209 @@ static int binder_thread_write(struct binder_proc *proc,
 				debug_string = "DecRefs";
 				break;
 			}
+			if(ret) {
+				binder_user_error("%d:%d %s %d refcount change on invalid ref %d ret %d\n",
+					proc->pid, thread->pid, debug_string,
+					strong, target, ret);
+				break;
+			}
+			binder_debug(BINDER_DEBUG_USER_REFS,
+				"%d:%d %s ref %d desc %d s %d w %d\n",
+				proc->pid, thread->pid, debug_string,
+				rdata.debug_id, rdata.desc, rdata.strong,
+				rdata.weak);
+			break;
 			
 		}
+		case BC_INCREFS_DONE:
+		case BC_ACQUIRE_DONE: {
+			binder_uintptr_t node_ptr;
+			struct binder_node *node;
+			bool free_node;
+			
+			if(get_user(node_ptr, (binder_uintptr_t __user *)ptr))
+				return -EFAULT;
+			ptr += sizeof(binder_uintptr_t);
+			if(get_user(cookie, (binder_uintptr_t __user *)ptr))
+				return -EFAULT;
+			ptr += sizeof(binder_uintptr_t);
+			node = binder_get_node(proc, node_ptr);
+			if(node == NULL) {
+				binder_user_error("%d:%d %s u%016llx no match\n",
+					proc->pid, thread->pid,
+					cmd == BC_INCREFS_DONE ?
+					"BC_INCREFS_DONE" :
+					"BC_ACQUIRE_DONE",
+					(u64)node_ptr);
+				break;
+			}
+			if(cookie != node->cookie) {
+				binder_user_error("%d: %d %s u%016llx node %d cookie mismatch %016llx != %016llx\n",
+					proc->pid, thread->pid,
+					cmd == BC_INCREFS_DONE ?
+					"BC_INCREFS_DONE" : "BC_ACQUIRE_DONE",
+					(u64)node_ptr, node->debug_id,
+					(u64)cookie, (u64)node->cookie);
+				binder_put_node(node);
+				break;
+			}
+			binder_node_inner_lock(node);
+			if(cmd == BC_ACQUIRE_DONE) {
+				if(node->pending_strong_ref == 0) {
+					binder_user_error("%d: %d BC_ACQUIRE_DONE node %d has no pending acquire request\n",
+						proc->pid, thread->pid,
+						node->debug_id);
+					binder_node_inner_unlock(node);
+					binder_put_node(node);
+					break;
+				}
+				node->pending_strong_ref = 0;
+			} else {
+				if(node->pending_weak_ref == 0) {
+					binder_user_error("%d: %d BC_INCREFS_DONE node %d has no pending increfs request\n",
+						proc->pid, thread->pid,
+						node->debug_id);
+					binder_node_inner_unlock(node);
+					binder_put_node(node);
+					break;
+				}
+				node->pending_weak_ref = 0;
+			}
 		}
+		free_node = binder_dec_node_nilocked(node,
+					cmd == BC_ACQUIRE_DONE, 0);
+		WARN_ON(free_node);
+		binder_debug(BINDER_DEBUG_USER_ERROR,
+			"%d:%d %s node %d ls %d lw %d tr %d\n",
+			proc->pid, thread->pid,
+			cmd == BC_INCREFS_DONE ? "BC_INCREFS_DONE" : "BC_ACQUIRE_DONE",
+			node->debug_id, node->local_strong_refs,
+			node->local_weak_refs, node->tmp_refs);
+		binder_node_inner_unlock(node);
+		binder_put_node(node);
+		break;
+		}
+	case BC_ATTEMPT_ACQUIRE:
+		pr_err("BC_ATTEMPT_ACQUIRE not supported\n");
+		break;
+	case BC_ACQUIRE_RESULT:
+		pr_err("BC_ACQUIRE_RESULT not supported\n");
+		break;
+	case BC_FREE_BUFFER: {
+		binder_uintptr_t data_ptr;
+		struct binder_buffer *buffer;
+		
+		if(get_user(data_ptr, (binder_uintptr_t __user *)ptr))
+			return -EFAULT;
+		ptr += sizeof(binder_uintptr_t);
+		
+		buffer = binder_alloc_prepare_to_free(&proc->alloc,
+							data_ptr);
+		if(buffer == NULL) {
+			binder_user_error("%d: %d BC_FREE_BUFFER u%016llx no match\n",
+					proc->pid, thread->pid, (u64) data_ptr);
+			break;
+		}
+		if(!buffer->allow_user_free) {
+			binder_user_error("%d: %d BC_FREE_BUFFER u%016llx matched unreturned buffer\n",
+				proc->pid, thread->pid, (u64)data_ptr);
+			break;
+		}
+		binder_debug(BINDER_DEBUG_FREE_BUFFER,
+			"%d:%d BC_FREE_BUFFER u%016llx found buffer %d for %s transaction\n",
+			proc->pid, thread->pid, (u64)data_ptr,
+			buffer->debug_id,
+			buffer->transaction ? "active" : " finished");
+		if(buffer->transaction) {
+			buffer->transaction->buffer = NULL;
+			buffer->transaction = NULL;
+		}
+		
+		if(buffer->async_transaction && buffer->target_node) {
+			struct binder_node *buf_node;
+			struct binder_work *w;
+			
+			buf_node = buffer->target_node;
+			binder_node_inner_lock(buf_node);
+			BUG_ON(!buf_node->has_async_transaction);
+			BUG_ON(buf_node->proc != proc);
+			w = binder_dequeue_work_head_ilocked(
+					&buf_node->async_todo);
+			if(!w) {
+				buf_node->has_async_transaction = 0;
+			} else {
+				binder_enqueue_work_ilocked(
+						w,&proc->todo);
+				binder_wakeup_proc_ilocked(proc);
+			}
+			binder_node_inner_unlock(buf_node);
+		}
+		trace_binder_transaction_buffer_release(buffer);
+		binder_transaction_buffer_release(proc, buffer, NULL);
+		binder_alloc_free_buf(&proc->alloc, buffer);
+		break;
+	}
+	case BC_TRANSACTION_SG:
+	case BC_REPLY_SG: {
+		struct binder_transaction_data_sg tr;
+		
+		if(copy_from_user(&tr, ptr, sizeof(tr)))
+			return -EFAULT;
+		ptr += sizeof(tr);
+		
+		binder_transaction(proc, thread, &tr.transaction_data,
+				cmd == BC_REPLY_SG, tr.buffer_size);
+		break;
+	}
+	case BC_TRANSACTION:
+	case BC_REPLY: {
+		struct binder_transaction_data tr;
+		
+		if(copy_from_user(&tr, ptr, sizeof(tr)))
+			return -EFAULT;
+		ptr += sizeof(tr);
+		binder_transaction(proc, thread, &tr,
+					cmd == BC_REPLY, 0);
+		break;
+	}
+	case BC_REGISTER_LOOPER:
+		binder_debug(BINDER_DEBUG_THREADS,
+			"d:%d BC_REGISTER_LOOPER\n",
+			proc->pid, thread->pid);
+		binder_inner_proc_lock(proc);
+		if(thread->looper & BINDER_LOOPER_STATE_ENTERED) {
+			thread->looper |= BINDER_LOOPER_STATE_INVALID;
+			binder_user_error("%d:%d ERROR: BC_REGISTER_LOOPER called after BC_ENTER_LOOPER\n",
+				proc->pid, thread->pid);
+			
+		} else if (proc->requested_threads == 0) {
+			thread->looper |= BINDER_LOOPER_STATE_INVALID;
+			binder_user_error("%d:%d ERROR: BC_REGISTER_LOOPER called without request\n",
+				proc->pid, thread->pid);
+		} else {
+			proc->requested_threads--;
+			proc->requested_threads_started++;
+		}
+		thread->looper |= BINDER_LOOPER_STATE_REGISTERED;
+		binder_inner_proc_unlock(proc);
+		break;
+	case BC_ENTER_LOOPER:
+		binder_debug(BINDER_DEBUG_THREADS,
+			:%d:%d BC_ENTER_LOOPER\n",
+			proc->pid, thread->pid);
+		if(thread->looper & BINDER_LOOPER_STATE_REGISTERED) {
+			thread->looper |= BINDER_LOOPER_STATE_INVALID;
+			binder_user_error("%d:%d ERROR: BC_ENTER_LOOPER called after BC_REGISTER_LOOPER\n",
+				proc->pid, thread->pid);
+		}
+		thread->looper |= BINDER_LOOPER_STATE_ENTERED;
+		break;
+	case BC_EXIT_LOOPER:
+		binder_debug(BINDER_DEBUG_THREADS,
+			"%d:%d BC_EXIT_LOOPER\n",
+			proc->pid, thread->pid);
+		thread->looper |= BINDER_LOOPER_STATE_EXITED;
+		break;
 	}
 }
 
