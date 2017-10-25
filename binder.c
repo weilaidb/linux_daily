@@ -3431,13 +3431,331 @@ static int binder_thread_write(struct binder_proc *proc,
 			proc->pid, thread->pid);
 		thread->looper |= BINDER_LOOPER_STATE_EXITED;
 		break;
+	case BC_REQUEST_DEATH_NOTIFICATION:
+	case BC_CLEAR_DEATH_NOTIFICATION: {
+		uint32_t target;
+		binder_uintptr_t cookie;
+		struct binder_ref *ref;
+		struct binder_ref_death *death = NULL;
+		
+		if(get_user(target, (uint32_t __user *)ptr)) {
+			return -EFAULT;
+		}
+		ptr += sizeof(uint32_t);
+		if(get_user(cookie, (binder_uintptr_t __user *)ptr))
+			return -EFAULT;
+		ptr += sizeof(binder_uintptr_t);
+		if(cmd == BC_REQUEST_DEATH_NOTIFICATION) {
+			/**
+			** Allocate memory for death notification
+			** before taking lock
+			**/
+			death = kzalloc(sizeof(*death), GFP_KERNEL);
+			if(death == NULL) {
+				WARN_ON(thread->return_error.cmd != BR_OK);
+				thread->return_error.cmd = BR_ERROR;
+				binder_enqueue_work(
+					thread->proc,
+					&thread->return_error.work,
+					&thread->todo);
+				binder_debug(
+					BINDER_DEBUG_FAILED_TRANSACTION,
+					"%d:%d BC_REQUEST_DEATH_NOTIFICATION failed\n",
+					proc->pid, thread->pid);
+				break;
+			}
+			
+		}
+		binder_proc_lock(proc);
+		ref = binder_get_ref_olocked(proc, target, false);
+		if(ref == NULL) {
+			binder_user_error("%d:%d %s invalid ref %d\n",
+				proc->pid, thread->pid,
+				cmd == BC_REQUEST_DEATH_NOTIFICATION ?
+				"BC_REQUEST_DEATH_NOTIFICATION" :
+				"BC_CLEAR_DEATH_NOTIFICATION",
+				target);
+			binder_proc_unlock(proc);
+			kfree(death);
+			break;
+		}
+		binder_debug(BINDER_DEBUG_DEATH_NOTIFICATION,
+			"%d:%d %s %016llx ref %d desc %d s %d w %d for node %d\n",
+			proc->pid, thread->pid,
+			cmd == BC_REQUEST_DEATH_NOTIFICATION ?
+			"BC_REQUEST_DEATH_NOTIFICATION" :
+			"BC_CLEAR_DEATH_NOTIFICATION",
+			(u64)cookie, ref->data.debug_id,
+			ref->data.desc, ref->data.strong,
+			ref->data.weak, ref->node->debug_id);
+	binder_node_lock(ref->node);
+	if(cmd == BC_REQUEST_DEATH_NOTIFICATION) {
+		if(ref->dead) {
+			binder_user_error("%d:%d BC_REQUEST_DEATH_NOTIFICATION death notification already set\n",
+				proc->pid, thread->pid);
+			binder_node_unlock(ref->node);
+			binder_proc_unlock(proc);
+			kfree(death);
+			break;
+		}
+		binder_stats_created(BINDER_STAT_DEATH);
+		INIT_LIST_HEAD(&death->work.entry);
+		death->cookie = cookie;
+		ref->death = death;
+		if(ref->node->proc == NULL) {
+			ref->death->work.type = BINDER_WORK_DEAD_BINDER;
+			
+			binder_inner_proc_lock(proc);
+			binder_enqueue_work_ilocked(
+				&ref->deadth->work, &proc->todo);
+			binder_wakeup_proc_ilocked(proc);
+			binder_inner_proc_unlock(proc);
+		}
+	} else {
+		if(ref->deadth == NULL) {
+			binder_user_error("%d:%d BC_CLEAR_DEATH_NOTIFICATION death notification not active\n",
+				proc->pid, thread->pid);
+			binder_node_unlock(ref->node);
+			binder_proc_unlock(proc);
+			break;
+		}
+		death = ref->deadth;
+		if(death->cookie != cookie) {
+			binder_user_error("%d: %d BC_CLEAR_DEATH_NOTIFICATION death notification cookie mismatch %016ll !- %016llx\n",
+				proc->pid, thread->pid,
+				(u64)death->cookie,
+				(u64)cookie);
+			binder_node_unlock(ref->node);
+			binder_proc_unlock(proc);
+			break;
+		}
+		ref->death = NULL;
+		binder_inner_proc_lock(proc);
+		if(list_empty(&death->work.entry)) {
+			death->work.type = BINDER_WORK_CLEAR_DEATH_NOTIFICATION;
+			if(thread->looper &
+				(BINDER_LOOPER_STATE_REGISTERED | 
+				BINDER_LOOPER_STATE_ENTERED))
+				binder_enqueue_work_ilocked(
+					&death->work,
+					&thread->todo);
+			else {
+				binder_enqueue_work_ilocked(
+					&death->work,
+					&proc->todo);
+				binder_wakeup_proc_ilocked(
+					proc);
+			}
+		} else {
+			BUG_ON(death->work.type != BINDER_WORK_DEAD_BINDER);
+			death->work.type = BINDER_WORK_DEAD_BINDER_AND_CLEAR;
+			
+		}
+		binder_inner_proc_unlock(proc);
 	}
+	binder_node_unlock(ref->node);
+	binder_proc_unlock(proc);
+	}break;
+	case BC_DEAD_BINDER_DONE: {
+		struct binder_work *w;
+		binder_uintptr_t cookie;
+		struct binder_ref_death *death = NULL;
+		
+		if(get_user(cookie, (binder_uintptr_t __user *) ptr))
+			return -EFAULT;
+		ptr += sizeof(cookie);
+		binder_inner_proc_lock(proc);
+		list_for_each_entry(w, &proc->delivered_death,
+			entry) {
+			struct binder_ref_death *tmp_death = 
+				container_of(w,
+					struct binder_ref_death,
+					work);
+			if(tmp_death->cookie == cookie) {
+				death  = tmp_death;
+				break;
+			}
+		}
+		binder_debug(BINDER_DEBUG_DEAD_BINDER,
+			"%d:%d BC_DEAD_BINDER_DONE %016llx found %p\n",
+			proc->pid, thread->pid, (u64) cookie,
+			death);
+		if(deadth == NULL) {
+			binder_user_error("%d: %d BC_DEAD_BINDER_DONE %016llx not found\n",
+				proc->pid, thread->pid, (u64)cookie);
+			binder_inner_proc_unlock(proc);
+			break;
+		}
+		binder_dequeue_work_ilocked(&death->work);
+		if(death->work.type == BINDER_WORK_DEAD_BINDER_AND_CLEAR) {
+			death->work.type == BINDER_WORK_CLEAR_DEATH_NOTIFICATION;
+			if(trehad->looper &
+				(BINDER_LOOPER_STATE_REGISTERED |
+				BINDER_LOOPER_STATE_ENTERED))
+				binder_enqueue_work_ilocked(
+					&death->work, &thread->todo);
+		else {
+			binder_enqueue_work_ilocked(
+				&death->work,
+				&proc->todo);
+			binder_wakeup_proc_ilocked(proc);
+		}
+		}
+		binder_inner_proc_unlock(proc);
+	}break;
+	default:
+		pr_err("%d:%d unknown command %d\n",
+			proc->pid, thread->pid, cmd);
+		return -EINVAL;
+		
+	}
+	*consumed = ptr - buffer;
+	}
+	return 0;
 }
 
 
+static void binder_stat_br(struct binder_proc *proc,
+				struct binder_thread *thread, uint32_t cmd)
+{
+	trace_binder_return(cmd);
+	if(_IOC_NR(cmd) < ARRAY_SIZE(binder_stats.br)) {
+		atomic_inc(&binder_stats.br[_IOC_NR(cmd)]);
+		atomic_inc(&proc->stats.br[_IOC_NR(cmd)]);
+		atomic_inc(&thread->stats.br[_IOC_NR(cmd)]);
+	}
+}
+static binder_has_thread_work(struct binder_thread *thread)
+{
+	return !binder_worklist_empty(thread->proc, &thread->todo) ||
+				thread->looper_need_return;
+}
 
+static int binder_put_node_cmd(struct binder_proc *proc,
+			struct binder_thread *thread,
+			void __user **ptrp,
+			binder_uintptr_t node_ptr,
+			binder_uintptr_t node_cookie,
+			int node_debug_id,
+			uint32_t cmd, const char *cmd_name)
+{
+	void __user *ptr = *ptrp;
+	
+	if(put_user(cmd, (uint32_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(uint32_t);
+	
+	if(put_user(node_ptr, (binder_uintptr_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(binder_uintptr_t);
+	
+	if(put_user(node_cookie, (binder_uintptr_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(binder_uintptr_t);
+	
+	binder_stat_br(proc, thread, cmd);
+	binder_debug(BINDER_DEBUG_USER_REFS, "%d:%d %s %d u %016llx c%016llx\n",
+		proc->pid, thread->pid, cmd_name, node_debug_id,
+		(u64)node_ptr, (u64)node_cookie);
+	
+	*ptrp = ptr;
+	return 0;
+}
 
+static int binder_wait_for_work(struct binder_thread *thread,
+				bool do_proc_work)
+{
+	DEFINE_WAIT(wait);
+	struct binder_proc *proc = thread->proc;
+	int ret = 0;
+	
+	freezer_do_not_count();
+	binder_inner_proc_lock(proc);
+	for(;;) {
+		prepare_to_wait(&thread->wait, &wait, TASK_INTERRUPTIBLE);
+		if(binder_has_work_ilocked(thread, do_proc_work))
+			break;
+		if(do_proc_work)
+			list_add(&thread->waiting_thread_node,
+				&proc->waiting_threads);
+		binder_inner_proc_unlock(proc);
+		scheduler();
+		binder_inner_proc_lock(proc);
+		list_del_init(&thread->waiting_thread_node);
+		if(signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+	}
+	
+	finish_wait(&thread->wait, &wait);
+	binder_inner_proc_unlock(proc);
+	freezer_count();
+	
+	return ret;
+}
 
+static int binder_thread_read(struct binder_proc *proc,
+				struct binder_thread *thread,
+				binder_uintptr_t binder_buffer, size_t size,
+				binder_size_t *consumed, int non_block)
+{
+	void __user *buffer = (void __user*)(uintptr_t) binder_buffer;
+	void __user *ptr = buffer + *consumed;
+	void __user *end = buffer + size;
+	
+	int ret = 0;
+	int wait_for_proc_work;
+	
+	if(*consumed == 0) {
+		if(put_user(BR_NOOP, (uint32_t __user *) ptr))
+			return -EFAULT;
+		ptr += sizeof(uint32_t);
+		
+	}
+	
+retry:
+	binder_inner_proc_lock(proc);
+	wait_for_proc_work = binder_available_for_proc_work_ilocked(thread);
+	binder_inner_proc_unlock(proc);
+	
+	thread->looper |= BINDER_LOOPER_STATE_WAITING;
+	
+	trace_binder_wait_for_work(wait_for_proc_work,
+			!!thread->transaction_stack,
+			!binder_worklist_empty(proc, &thread->todo));
+	if(wait_for_proc_work) {
+		if(!(thread->looper & (BINDER_LOOPER_STATE_REGISTERED |
+			BINDER_LOOPER_STATE_ENTERED))) {
+			binder_user_error("%d:%d ERROR: Thread waiting for process work before calling BC_REGISTER_LOOPER or BC_ENTER_LOOPER(state %x)\n",
+				proc->pid, thread->pid, thread->looper);
+			wait_event_interruptible(binder_user_error_wait,
+				binder_stop_on_user_error < 2);
+			
+		}
+		binder_set_nice(proc->default_priority);
+	}
+	if(non_block) {
+		if(!binder_has_work(thread, wait_for_proc_work))
+			ret = -EAGAIN;
+	} else {
+		ret = binder_wait_for_work(thread, wait_for_proc_work);
+	}
+	thread->looper &=  ~BINDER_LOOPER_STATE_WAITING;
+	
+	if(ret)
+		return ret;
+	
+	while(1) {
+		uint32_t cmd;
+		struct binder_transaction_data tr;
+		struct binder_work *w  = NULL;
+		struct list_head *list = NULL;
+		struct binder_transaction *t = NULL;
+		struct binder_thread *t_from;
+		
+	}
+}
 
 
 
