@@ -4143,6 +4143,136 @@ static struct binder_thread *binder_get_thread_ilocked(
 	return thread;
 }
 
+static struct binder_thread *binder_get_thread(struct binder_proc *proc)
+{
+	struct binder_thread *thread;
+	struct binder_thread *new_thread;
+	
+	binder_inner_proc_lock(proc);
+	thread = binder_get_thread_ilocked(proc, NULL);
+	binder_inner_proc_unlock(proc);
+	if(!thread) {
+		new_thread = kzalloc(sizeof(*thread), GFP_KERNEL);
+		if(new_thread == NULL)
+			return NULL;
+		binder_inner_proc_lock(proc);
+		thread = binder_get_thread_ilocked(proc, new_thread);
+		if(thread != new_thread)
+			kfree(new_thread);
+	}
+	return thread;
+}
+
+static void binder_free_proc(struct binder_proc *proc)
+{
+	BUG_ON(!list_empty(&proc->todo));
+	BUG_ON(!list_empty(&proc->delivered_death));
+	binder_alloc_deferred_release(&proc->alloc);
+	put_task_struct(proc->tsk);
+	binder_stats_deleted(BINDER_STAT_PROC);
+	kfree(proc);
+}
+
+static void binder_free_thread(struct binder_thread *thread)
+{
+	BUG_ON(!list_empty(&thread->todo));
+	binder_stats_deleted(BINDER_STAT_THREAD);
+	binder_proc_dec_tmpref(thread->proc);
+	kfree(thread);
+}
+
+static int binder_thread_release(struct binder_proc *proc,
+			struct binder_thread *thread)
+{
+	struct binder_transaction *t;
+	struct binder_transaction *send_reply = NULL;
+	int active_transactions = 0;
+	struct binder_transaction *last_t = NULL;
+	
+	binder_inner_proc_lock(thread->proc);
+	
+	/**
+	** take a ref on the proc so it survives
+	** after we remove this thread from proc->threads.
+	** The corresponding dec is when we actually
+	** free the thread in binder_free_thread()
+	**/
+	proc->tmp_ref++;
+	/** 
+	** take a ref on this thread to ensure it 
+	** survives while we are releasing it 
+	**/
+	atomic_inc(&thread->tmp_ref);
+	rb_erase(&thread->rb_node, &proc->threads);
+	t = thread->transaction_stack;
+	if(t) {
+		spin_lock(&t->lock);
+		if(t->to_thread == thread)
+			send_reply = t;
+	}
+	thread->is_dead = true;
+	
+	while(t) {
+		last_t = t;
+		active_transactions++;
+		binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
+			"release %d:%d transaction %d %s , still active\n",
+			proc->pid, thread->pid,
+			t->debug_id,
+			(t->to_thread == thread) ? "in" : "out");
+		
+		if(t->to_thread == thread) {
+			t->to_proc = NULL;
+			t->to_thread = NULL;
+			if(t->buffer ) {
+				t->buffer->transaction = NULL;
+				t->buffer = NULL;
+			}
+			t = t->to_parent;
+		} else if(t->from == thread) {
+			t->from = NULL;
+			t = t->from_parent;
+		} else 
+			BUG();
+		spin_unlock(&last_t->lock);
+		if(t)
+			spin_lock(&t->lock);
+	}
+	
+	binder_inner_proc_unlock(thread->proc);
+	
+	if(send_reply)
+		binder_send_failed_reply(send_reply, BR_DEAD_REPLY);
+	binder_release_work(proc, &thread->todo);
+	binder_thread_dec_tmpref(thread);
+	return active_transactions;
+}
+
+static unsigned int binder_poll(struct file *filp,
+				struct poll_table_struct *wait)
+{
+	struct binder_proc *proc = filp->private_data;
+	struct binder_thread *thread = NULL;
+	bool wait_for_proc_work;
+	
+	thread = binder_get_thread(proc);
+	
+	binder_inner_proc_lock(thread->proc);
+	thread->looper |= BINDER_LOOPER_STATE_POLL;
+	wait_for_proc_work =  binder_available_for_proc_work_ilocked(thread);
+	
+	binder_inner_proc_unlock(thread->proc);
+	
+	if(binder_has_work(thread, wait_for_proc_work))
+		return POLLIN;
+	poll_wait(filp, &thread->wait, wait);
+	
+	if(binder_has_thread_work(thread))
+		return POLLIN;
+	
+	return 0;
+}
+
 
 
 
