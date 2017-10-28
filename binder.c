@@ -4273,12 +4273,279 @@ static unsigned int binder_poll(struct file *filp,
 	return 0;
 }
 
+static int binder_ioctl_write_read(struct file *filp,
+			unsigned int cmd, unsigned long arg,
+			struct binder_thread *thread)
+{
+	int ret = 0;
+	struct binder_proc *proc = filp->private_data;
+	unsigned int size = _IOC_SIZE(cmd);
+	void __user *ubuf = (void __user *)arg;
+	struct binder_write_read bwr;
+	
+	if(size != sizeof(struct binder_write_read)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	
+	if(copy_from_user(&bwr, ubuf, sizeof(bwr))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	
+	binder_debug(BINDER_DEBUG_READ_WRITE,
+		"%d:%d write %lld at %016llx, read %lld %016llx\n",
+		proc->pid, thread->pid,
+		(u64)bwr.write_size, (u64)bwr.write_buffer,
+		(u64)bwr.read_size, (u64)bwr.read_buffer);
+	if(bwr.write_size > 0) {
+		ret = binder_thread_write(proc, thead,
+					bwr.write_size,
+					bwr.write_buffer,
+					&bwr.write_consumed);
+		trace_binder_write_done(ret);
+		if(ret < 0) {
+			bwr.read_consumed = 0;
+			if(copy_to_user(ubuf, &bwr, sizeof(bwr))
+				ret = -EFAULT;
+			goto out;
+		}
+	}
+	
+	if(bwr.read_size > 0) {
+		ret = binder_thread_read(proc, thread, bwr.read_buffer,
+					bwr.read_size,
+					&bwr.read_consumed,
+					filp->f_flags & O_NONBLOCK);
+		trace_binder_read_done(ret);
+		binder_inner_proc_lock(proc);
+		if(!binder_worklist_empty_ilocked(&proc->todo))
+			binder_wakeup_proc_ilocked(proc);
+		binder_inner_proc_unlock(proc);
+		if(ret < ) {
+			if(copy_to_user(ubuf, &bwr, size(bwr)))
+				ret = -EFAULT;
+			goto out;
+		}
+	}
+	
+	binder_debug(BINDER_DEBUG_READ_WRITE,
+		"%d:%d wrote %lld of %lld, read return %lld of %lld\n",
+		proc->pid, thread->pid,
+		(u64)bwr.write_consumed, (u64)bwr.write_size,
+		(u64)bwr.read_consumed, (u64)bwr.read_size);
+	if(copy_to_user(ubuf, &bwr, sizeof(bwr))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	
+out: 
+	return ret;
+	
+}
 
 
 
+static int binder_ioctl_set_ctx_mgr(struct file *flip)
+{
+	int ret = 0;
+	struct binder_proc *proc = filp->private_data;
+	struct binder_context * context = proc->context;
+	struct binder_node *new_node;
+	kuid_t curr_euid = current_euid();
+	
+	mutex_lock(&context->context_mgr_node_lock);
+	if(context->binder_context_mgr_node) {
+		pr_err("BINDER_SET_CONTEXT_MGR already set \n");
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = security_binder_set_context_mgr(proc->tsk);
+	if(ret < 0)
+		goto out;
+	if(uid_valid(context->binder_context_mgr_uid)) {
+		if(!uid_eq(context->binder_context_mgr_uid, curr_euid)) {
+			pr_err("BINDER_SET_CONTEXT_MGR bad uid %d != %d\n",
+			from_kuid(&init_user_ns, curr_euid),
+			from_kuid(&init_user_ns,
+				context->binder_context_mgr_uid));
+			ret = -EPERM;
+			goto out;
+		}
+	} else {
+		context->binder_context_mgr_uid = curr_euid;
+	}
+	new_node = binder_new_node(proc, NULL);
+	if(!new_node) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	binder_node_lock(new_node);
+	new_node->local_weak_refs++;
+	new_node->local_strong_refs++;
+	new_node->has_strong_ref = 1;
+	new_node->has_weak_ref = 1;
+	context->binder_context_mgr_node = new_node;
+	binder_node_unlock(new_node);
+	binder_put_node(new_node);
+out:
+	mutex_unlock(&context->context_mgr_node_lock);
+	return ret;
+}
 
+static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
+				struct binder_node_debug_info *info)
+{
+	struct rb_node *n;
+	binder_uintptr_t ptr = info->ptr;
+	
+	memset(info, 0, sizeof(*info));
+	
+	binder_inner_proc_lock(proc);
+	for(n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
+		struct binder_node *node = rb_entry(n, struct binder_node,
+						rb_node);
+		if(node->ptr >ptr) {
+			info->ptr = node->ptr;
+			info->cookie = node->cookie;
+			info->has_strong_ref = node->has_strong_ref;
+			info->has_weak_ref = node->has_weak_ref;
+			break;
+		}
+	}
+	binder_inner_proc_unlock(proc);
+	
+	return 0;
+}
 
+static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int ret;
+	struct binder_proc *proc = filp->private_data;
+	struct binder_thread *thread;
+	unsigned int size = _IOC_SIZE(cmd);
+	void __user *ubuf = (void __user *) arg;
+	
+	/** pr_info("binder_ioctl:%d:%d %x %lx\n",
+		proc->pid, current->pid, cmd, arg ); */
+	binder_selftest_alloc(&proc->alloc);
+	trace_binder_ioctl(cmd, arg);
+	
+	ret = wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+	if(ret)
+		goto err_unlocked;
+	
+	thread = binder_get_thread(proc);
+	if(thread == NULL) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	
+	switch(cmd) {
+	case BINDER_WRITE_READ:
+		ret = binder_ioctl_write_read(filp, cmd, arg, thread);
+		if(ret)
+			goto err;
+		break;
+	case BINDER_SET_MAX_THREADS:{
+		int max_threads;
+		
+		if(copy_from_user(&max_threads, ubuf,
+				sizeof(max_threads))) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+		proc->max_threads = max_threads;
+		binder_inner_proc_unlock(proc);
+		break;
+	}
+	case BINDER_SET_CONTEXT_MGR:
+		ret = binder_ioctl_set_ctx_mgr(filp);
+		if(ret)
+			goto err;
+		break;
+	case BINDER_THREAD_EXIT:
+		binder_debug(BINDER_DEBUG_THREADS, "%d:%d exit\n",
+			proc->pid, thread->pid);
+		binder_thread_release(proc, thread);
+		thread = NULL;
+		break;
+	case BINDER_VERSION: {
+		struct binder_version __user *ver = ubuf;
+		
+		if(size != sizeof(struct binder_version )) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if(put_user(BINDER_CURRENT_PROTOCAL_VERSION,
+			&ver->protocal_version)){
+			ret = -EINVAL;
+			goto err;
+		}
+		break;
+	}
+	case BINDER_GET_NODE_DEBUG_INFO: {
+		struct binder_node_debug_info info;
+		
+		if(copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		ret = binder_ioctl_get_node_debug_info(proc, &info);
+		if(ret < 0) 
+			goto err;
+		
+		if(copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+	default:
+		ret = -EINVAL;
+		goto err;
+	
+	
+	}
+	ret = 0;
+	
+err:
+	if(thread)
+		thread->looper_need_return = false;
+	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error <2 );
+	if(ret & ret != -ERESTARTSYS)
+		pr_info("%d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd ,arg, ret);
+	
+err_unlocked:
+	trace_binder_ioctl_done(ret);
+	return ret;
+	
+}
 
+static void binder_vma_open(struct vm_area_struct *vma)
+{
+	struct binder_proc *proc = vma->vm_private_data;
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
+		"%d open vm area %lx-%lx( %ld K) vma %lx pagep %lx\n",
+		proc->pid, vma->vm_start, vma->vm_end,
+		(vma->vm_end - vma->vm_start) /SZ_1K, vma->vm_flags,
+		(unsigned long) pgprot_val(vma->vm_page_prot));
+}
+
+static void binder_vma_close(struct vm_area_struct *vma)
+{
+	struct binder_proc *proc = vma->vm_private_data;
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
+		"%d close vm area %lx-%lx (%ld K) vma %lx pagep %lx\n",
+		proc->pid, vma->vm_start, vma->vm_end,
+		(vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
+		(unsigned long)pgprot_val(vma->vm_page_prot));
+	binder_alloc_vma_close(&proc->alloc);
+	binder_defer_work(proc, BINDER_DEFERRED_PUT_FILES);
+}
 
 
 
