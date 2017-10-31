@@ -4547,10 +4547,409 @@ static void binder_vma_close(struct vm_area_struct *vma)
 	binder_defer_work(proc, BINDER_DEFERRED_PUT_FILES);
 }
 
+static int binder_vm_fault(struct vm_fault *vmf)
+{
+	return VM_FAULT_SIGBUS;
+}
+
+static const struct vm_operations_struct binder_vm_ops = {
+	.open = binder_vma_open,
+	.close = binder_vma_close,
+	.fault = binder_vm_fault,
+};
+
+static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	int ret;
+	struct binder_proc  *proc = filp->private_data;
+	const char *failure_string;
+	
+	
+	if(proc->tsk != current->group_leader)
+		return -EINVAL;
+	
+	if((vma->vm_end - vma->vm_start) > SZ_4M)
+		vma->vm_end = vma->vm_start + SZ_4M;
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
+		"%s:%d %lx-%lx(%ld K) vma %lx pagep %lx\n",
+		__func__, proc->pid, vma->vm_start , vma->vm_end,
+		(vma->vm_end - vma->vm_start) / SZ_1K, vma->vm_flags,
+		(unsigned long)pgprot_val(vma->vm_page_prot));
+	
+	if(vma->vm_flags & FORBINDDEN_MMAP_FLAGS) {
+		ret = -EPERM;
+		failure_string = "bad vm_flags";
+		goto err_bad_arg;
+	}
+	
+	vma->vm_flags = (vma->vm_flags | VM_DONTCOPY ) & ~VM_MAYWRITE;
+	vma->vm_ops = &binder_vm_ops;
+	vma->vm_private_data = proc;
+	
+	ret = binder_alloc_mmap_handler(&proc->alloc, vma);
+	if(ret)
+		return ret;
+	proc->files = get_files_struct(current);
+	
+	return 0;
+
+err_bad_arg:
+	pr_err("binder_mmap :%d %lx-%lx %s failed %d\n",
+		proc->pid, vma->vm_start, vma->vm_end, failure_string, ret);
+	return ret;
+	
+}
+
+static int binder_open(struct inode *nodp, struct file *filp)
+{
+	struct binder_proc *proc;
+	struct binder_device *binder_dev;
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "binder_open: %d:%d\n",
+		current->group_leader->pid, current->pid);
+	
+	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
+	if(proc == NULL)
+		return -ENOMEM;
+	spin_lock_init(&proc->inner_lock);
+	spin_lock_init(&proc->outer_lock);
+	get_task_struct(current->group_leader);
+	INIT_LIST_HEAD(&proc->todo);
+	proc->default_priority = task_nice(current);
+	binder_dev = container_of(filp->private_data, struct binder_device,
+					miscdev);
+	proc->context = &binder_dev->context;
+	binder_alloc_init(&proc->alloc);
+	
+	binder_stats_created(BINDER_STAT_PROC);
+	proc->pid = current->group_leader->pid;
+	INIT_LIST_HEAD(&proc->delivered_death);
+	INIT_LIST_HEAD(&proc->waiting_threads);
+	filp->private_data = proc;
+	
+	mutex_lock(&binder_procs_lock);
+	hlist_add_head(&proc->proc_node, &binder_procs);
+	mutex_unlock(&binder_procs_lock);
+	
+	if(binder_debugfs_dir_entry_proc) {
+		char strbuf[11];
+		
+		snprintf(strbuf, sizeof(strbuf), "%u", proc->pid);
+		
+		/**
+		** proc debug entries are shared between contexts, so 
+		** this will fail if the process tries to open the driver
+		** again with a different context. The priting code will
+		** anyway print all contexts that a given PID has, so this 
+		** is not a problem.
+		**/
+		proc->debugfs_entry = debugfs_create_file(strbuf, S_IRUGO,
+			binder_debugfs_dir_entry_proc,
+			(void *)(unsigned long)proc->pid,
+			&binder_proc_fops);
+			
+	}
+	
+	return 0;
+}
+
+static int binder_flush(struct file *filp, fl_owner_t id)
+{
+	struct binder_proc *proc = filp->private_data;
+	
+	binder_defer_work(proc, BINDER_DEFERRED_FLUSH);
+	
+	return 0;
+}
+
+static void  binder_deferred_flush(struct binder_proc *proc)
+{
+	struct rb_node *n;
+	int wake_count = 0;
+	
+	binder_inner_proc_lock(proc);
+	
+	for(n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
+		struct binder_thread *thread = rb_entry(n, struct binder_thread, rb_node);
+		
+		thread->looper_need_return = true;
+		
+		if(thread->looper & BINDER_LOOPER_STATE_WAITING) {
+			wake_up_interruptible(&thread->wait);
+			wake_count++;
+		}
+	}
+	binder_inner_proc_unlock(proc);
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
+		"binder_flush: %d woke %d threads\n", proc->pid,
+		wake_count);
+}
+
+static int binder_release(struct inode *nodep, struct file *filp)
+{
+	struct binder_proc *proc = filp->private_data;
+	
+	debugfs_remove(proc->debugfs_entry);
+	binder_defer_work(proc, BINDER_DEFERRED_RELEASE);
+	
+	return 0;
+}
+
+static int binder_node_release(struct binder_node *node, int refs)
+{
+	struct binder_ref *ref;
+	int death = 0;
+	struct binder_proc *proc = node->proc;
+	
+	binder_release_work(proc, &node->async_todo);
+	
+	binder_node_lock(node);
+	binder_inner_proc_lock(proc);
+	binder_dequeue_work_ilocked(&node->work);
+	
+	/** 
+	** The caller must have taken a temporary ref on the node,
+	**/
+	BUG_ON(!node->tmp_refs);
+	if(hlist_empty(&node->refs) && node->tmp_refs == 1) {
+		binder_inner_proc_unlock(proc);
+		binder_node_unlock(node);
+		binder_free_node(node);
+		
+		return refs;
+	}
+	
+	node->proc = NULL;
+	node->local_strong_refs = 0;
+	node->local_weak_refs = 0;
+	
+	binder_inner_proc_unlock(proc);
+	
+	spin_lock(&binder_dead_nodes_lock);
+	hlist_add_head(&node->dead_node, &binder_dead_nodes);
+	spin_unlock(&binder_dead_nodes_lock);
+	
+	hlist_for_each_entry(ref, &node->refs, node_entry) {
+		refs++;
+		/**
+		** Need the node lock to synchronize
+		** with new notification requests and the 
+		** inner lock to synchronize with queued
+		** death notifications.
+		**/
+		binder_inner_proc_lock(ref->proc);
+		if(!ref->death){
+			binder_inner_proc_unlock(ref->proc);
+			continue;
+		}
+		
+		death++;
+		
+		BUG_ON(!list_empty(&ref->death->work.entry));
+		ref->deadth->work.type = BINDER_WORK_DEAD_BINDER;
+		binder_enqueue_work_ilocked(&ref->death->work,
+			&ref->proc->todo);
+		binder_wakeup_proc_ilocked(ref->proc);
+		binder_inner_proc_unlock(ref->proc);
+	}
+	
+	binder_debug(BINDER_DEBUG_DEAD_BINDER,
+		"node %d now dead, refs %d, death %d\n",
+		node->debug_id, refs, death);
+	binder_node_unlock(node);
+	binder_put_node(node);
+	
+	return refs;
+}
 
 
+static void binder_deferred_release(struct binder_proc *proc)
+{
+	struct binder_context *context = proc->context;
+	struct rb_node *n;
+	int threads, nodes, incomming_refs, outgoing_refs, active_transactions;
+	
+	BUG_ON(proc->files);
+	
+	mutex_lock(&binder_procs_lock);
+	hlist_del(&proc->proc_node);
+	mutex_unlock(&binder_procs_lock);
+	
+	
+	mutex_lock(&context->context_mgr_node_lock);
+	if(context->binder_context_mgr_node->proc == proc) {
+		binder_debug(BINDER_DEBUG_DEAD_BINDER,
+			"%s: %d context_mgr_node gone\n",
+			__func__, proc->pid);
+		context->binder_context_mgr_node = NULL;
+	}
+	mutex_unlock(&context->context_mgr_node_lock);
+	binder_inner_proc_lock(proc);
+	/** 
+	** Make sure proc stays alive after we 
+	** remove all the threads
+	**/
+	proc->tmp_ref++;
+	proc->id_dead = true;
+	threads = 0;
+	active_transactions = 0;
+	while((n = rb_first(&proc->threads))) {
+		struct binder_thread *thread;
+		
+		thread = rb_entry(n, struct binder_thread, rb_node);
+		binder_inner_proc_unlock(proc);
+		threads++;
+		active_transactions += binder_thread_release(proc, thread);
+		binder_inner_proc_lock(proc);
+	}
+	
+	nodes = 0;
+	incomming_refs = 0;
+	while((n = rb_first(&proc->nodes))) {
+		struct binder_node *node;
+		
+		node = rb_entry(n, struct binder_node, rb_node);
+		nodes++;
+		/** 
+		** take a temporary ref on the node before
+		** calling binder_node_release() which will either
+		** kfree() the node or call binder_put_node()
+		**/
+		binder_inc_node_tmpref_ilocked(node);
+		rb_erase(&node->rb_node, &proc->nodes);
+		binder_inner_proc_unlock(proc);
+		incomming_refs = binder_node_release(node, incomming_refs);
+		binder_inner_proc_lock(proc);
+	}
+	binder_inner_proc_unlock(proc);
+	
+	outgoing_refs = 0;
+	binder_proc_lock(proc);
+	while((n = rb_first(&proc->refs_by_desc))) {
+		struct binder_ref *ref;
+		
+		ref = rb_entry(n, struct binder_ref, rb_node_desc);
+		outgoing_refs++;
+		biinder_cleanup_ref_olocked(ref);
+		binder_proc_unlock(proc);
+		binder_free_ref(ref);
+		binder_proc_lock(proc);
+		
+	}
+	
+	binder_proc_unlock(proc);
+	
+	binder_release_work(proc, &proc->todo);
+	binder_release_work(proc, &proc->delivered_death);
+	
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE,
+		"%s:%d threads %d, nodes %d (ref %d), refs %d, active transactions %d\n",
+		__func__, proc->pid, threads, nodes, incomming_refs,
+		outgoing_refs, active_transactions);
+	binder_proc_dec_tmpref(proc);
+	
+}
+
+static void binder_deferred_func(struct work_struct *work)
+{
+	struct binder_proc *proc;
+	struct files_struct *files;
+	
+	int defer;
+	
+	do{
+		mutex_lock(&binder_deferred_lock);
+		if(!hlist_empty(&binder_deferred_list)) {
+			proc = hlist_empty(binder_deferred_list.first,
+						struct binder_proc, deferred_work_node);
+			hlist_del_init(&proc->deferred_work_node);
+			defer = proc->deferred_work;
+			proc->deferred_work = 0;;
+			
+		} else {
+			proc = NULL;
+			defer = 0;;
+		}
+		mutex_unlock(&binder_deferred_lock);
+		
+		files = NULL;
+		if(defer & BINDER_DEFERRED_PUT_FILES) {
+			files = proc->files;
+			if(files)
+				proc->files = NULL;
+		}
+		
+		if(defer & BINDER_DEFERRED_FLUSH)
+			binder_deferred_flush(proc);
+		
+		if(defer & BINDER_DEFERRED_RELEASE)
+			binder_deferred_release(proc); /** frees proc **/
+		
+		if(files)
+			put_files_struct(files);
+		
+	}while(proc);
+}
 
 
+static DECLARE_WORK(binder_deferred_work, binder_deferred_func);
+
+static void 
+binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer)
+{
+	mutex_lock(&binder_deferred_lock);
+	proc->deferred_work  |= defer;
+	if(hlist_unhashed(&proc->deferred_work_node)) {
+		hlist_add_head(&proc->deferred_work_node,
+				&binder_deferred_list);
+		schedule_work(&binder_deferred_work);
+	}
+	
+	mutex_unlock(&binder_deferred_lock);
+}
+
+
+static void print_binder_transaction_ilocked(struct seq_file *m,
+					struct binder_proc *proc,
+					const char *prefix,
+					struct binder_transaction *t)
+{
+	struct binder_proc *to_proc;
+	struct binder_buffer *buffer = t->buffer;
+	
+	spin_lock(&t->lock);
+	to_proc = t->to_proc;
+	seq_print(m,
+		"%s %d: %p form %d: %d to %d ：%d code %x flags %x pri %ld r%d",
+		prefix, t->debug_id, t,
+		t->from ?t->from->proc->pid : 0,
+		to_proc ? to_proc->pid : 0,
+		t->to_thread ? t->to_thread->pid : 0,
+		t->code, t->flags, t->priority,t->need_reply);
+	spin_unlock(&t->lock);
+	
+	if(proc != to_proc) {
+		/**
+		** Can only safely deref buffer if we are holding the 
+		** correct proc inner lock for this node 
+		**/
+		seq_puts(m, "\n");
+		return;
+	}
+	
+	if(buffer == NULL) {
+		seq_puts(m, "buffer free\n");
+		return;
+	}
+	
+	if(buffer->target_node)
+		seq_print(m, "node %d", buffer->target_node->debug_id);
+	seq_print(m, "size %zd: %zd data %p\n",
+		buffer->data_size, buffer->offsets_size,
+		buffer->data);
+}
 
 
 
