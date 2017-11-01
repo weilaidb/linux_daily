@@ -4952,7 +4952,89 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 }
 
 
+static void print_binder_thread_ilocked(struct seq_file *m,
+				struct binder_thread *thread,
+				int print_always)
+{
+	struct binder_transaction *t;
+	struct binder_work *w;
+	size_t start_pos = m->count;
+	size_t header_pos;
+	
+	seq_print(m, " thread %d: l %02x need_return %d tr %d\n",
+		thread->pid, thread->looper,
+		thread->looper_need_return,
+		atomic_read(&thread->tmp_ref));
+	header_pos = m->count;
+	t = thread->transaction_stack;
+	while(t) {
+		if(t->from == thread) {
+			print_binder_transaction_ilocked(m, thread->proc,
+				"  outgoing transaction", t);
+			t = t->from_praent;
+		} else if (t->to_thread == thread) {
+			print_binder_transaction_ilocked(m, thread->proc,
+				"  incomming transaction", t);
+			t = t->to_parent;
+		} else {
+			print_binder_transaction_ilocked(m, thread->proc,
+				"  bad transaction",t );
+			t = NULL;
+		}
+	}
+	list_for_each_entry(w, &thread->todo, entry) {
+		print_binder_work_ilocked(m, thread->proc, "  ",
+			"  pending transaction", w);
+			
+	}
+	
+	if(!print_always && m->count == header_pos)
+		m->count = start_pos;
+}
 
+static void print_binder_node_nilocked(struct seq_file *m,
+				struct binder_node *node)
+{
+	struct binder_ref *ref;
+	struct binder_work *w;
+	int count;
+	
+	count = 0;
+	
+	hlist_for_each_entry(ref, &node->refs, node_entry)
+	count++;
+	
+	seq_print(m, " node %d: u%016llx c%016llx hs %d hw %d ls %d lw %d is %d iw %d tr %d",
+			node->debug_id, (u64)node->ptr, (u64)node->cookie,
+			node->has_strong_ref, node->has_weak_ref,
+			node->local_strong_refs, node->local_weak_refs,
+			node->internal_strong_refs, count, node->tmp_refs);
+			
+	if(count) {
+		seq_puts(m, " proc");
+		hlist_for_each_entry(ref, &node->refs, node_entry)
+			seq_print(m, " %d", ref->proc->pid);
+	}
+	
+	seq_puts(m, "\n");
+	if(node->proc) {
+		list_for_each_entry(w, &node->async_todo, entry)
+			print_binder_work_ilocked(m, node->proc, "  ",
+				"  pending async transaction", w);
+	}
+}
+
+static void print_binder_ref_olocked(struct seq_file *m,
+				struct binder_ref *ref)
+{
+	binder_node_lock(ref->node);
+	seq_print(m, " ref %d: desc %d %s node %d s %d w %d d %pK\n",
+		ref->data.debug_id, ref->data.desc,
+		ref->node->proc ? "" : "dead",
+		ref->node->debug_id, ref->data.strong,
+		ref->data.weak, ref->death);
+	binder_inner_proc_unlock(ref->node);
+}
 
 
 
