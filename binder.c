@@ -5036,13 +5036,350 @@ static void print_binder_ref_olocked(struct seq_file *m,
 	binder_inner_proc_unlock(ref->node);
 }
 
+static void print_binder_proc(struct seq_file *m,
+				struct binder_proc *proc, int print_all)
+{
+	struct binder_work *w;
+	struct rb_node *n;
+	size_t start_pos = m->count;
+	size_t header_pos;
+	struct binder_node *last_node = NULL;
+	
+	seq_print(m, "proc %d\n", proc->pid);
+	seq_print(m, "context %s\n", proc->context->name);
+	header_pos = m->count;
+	
+	binder_inner_proc_lock(proc);
+	for(n = rb_first(&proc->threads); n!=NULL; n= rb_next(n))
+		print_binder_thread_ilocked(m, rb_entry(n, struct binder_thread,
+					rb_node), print_all);
+	
+	for(n = rb_first(&proc->nodes); n!= NULL; n = rb_next(n)) {
+		struct binder_node *node = rb_entry(n, struct binder_node,
+						rb_node);
+		/**
+		** take a temporary reference on the node so it 
+		** survives and isn't removed from the tree 
+		** while we print it 
+		**/
+		binder_inc_node_tmpref_ilocked(node);
+		/** Need to drop inner lock to take node lock */
+		binder_inner_proc_unlock(proc);
+		
+		if(last_node)
+			binder_put_node(last_node);
+		binder_node_inner_lock(node);
+		print_binder_node_nilocked(m, node);
+		binder_node_inner_unlock(node);
+		last_node = node;
+		binder_inner_proc_unlock(proc);
+		
+	}
+	binder_inner_proc_unlock(proc);
+	if(last_node)
+		binder_put_node(last_node);
+	
+	if(print_all) {
+		binder_proc_lock(proc);
+		for(n = rb_first(&proc->refs_by_desc);
+			n != NULL;
+			n = rb_next(n))
+			print_binder_ref_olocked(m, rb_entry(n,
+						struct binder_ref,
+						rb_node_desc));
+		binder_proc_unlock(proc);
+	}
+	binder_alloc_print_allocated(m, &proc->alloc);
+	binder_inner_proc_lock(proc);
+	list_for_each_entry(w, &proc->todo, entry)
+		print_binder_work_ilocked(m, proc, " ",
+			"  pending transaction", w);
+	list_for_each_entry(w, &proc->delivered_death, entry) {
+		seq_puts(m,  "  has delivered dead binder\n");
+		break;
+	}
+	
+	binder_inner_proc_unlock(proc);
+	if(!print_all && m->count == header_pos)
+		m->count = start_pos;
+}
+
+static const char *const binder_return_strings[] = {
+	"BR_ERROR",
+	"BR_OK",
+	"BR_TRANSACTION",
+	"BR_REPLY",
+	"BR_ACQUIRE_RESULT",
+	"BR_DEAD_REPLY",
+	"BR_TRANSACTION_COMPLETE",
+	"BR_INCREFS",
+	"BR_ACQUIRE",
+	"BR_RELEASE",
+	"BR_DECREFS",
+	"BR_ATTEMPT_ACQUIRE",
+	"BR_NOOP",
+	"BR_SPAWN_LOOPER",
+	"BR_FINISHED",
+	"BR_DEAD_BINDER",
+	"BR_CLEAR_DEATH_NOTIFICATION_DONE",
+	"BR_FAILED_REPLY",
+};
 
 
+static const char *const binder_command_strings[] = {
+	"BC_TRANSACTION",
+	"BC_REPLY",
+	"BC_ACQUIRE_RESULT",
+	"BC_FREE_BUFFER",
+	"BC_INCREFS",
+	"BC_ACQUIRE",
+	"BC_RELEASE",
+	"BC_DECREFS",
+	"BC_INCREFS_DONE",
+	"BC_ACQUIRE_DONE",
+	"BC_ATTEMPT_ACQUIRE",
+	"BC_REGISTER_LOOPER",
+	"BC_ENTER_LOOPER",
+	"BC_EXIT_LOOPER",
+	"BC_REQUEST_DEATH_NOTIFICATION",
+	"BC_CLEAR_DEATH_NOTIFICATION",
+	"BC_DEAD_BINDER_DONE",
+	"BC_TRANSACTION_SG",
+	"BC_REPLY_SG",
+};
 
 
+static const char * const binder_objstat_strings[] = {
+	"proc",
+	"thread",
+	"node",
+	"ref",
+	"death",
+	"transaction",
+	"transaction_complete",
+};
 
 
+static void  print_binder_stats(struct seq_file *m, const char *prefix,
+			struct binder_stats *stats)
+{
+	int i;
+	
+	BUILD_BUG_ON(ARRAY_SIZE(stats->bc) !=
+			ARRAY_SIZE(binder_command_strings));
+	for(i = 0; i <ARRAY_SIZE(stats->bc); i++) {
+		int temp = atomic_read(&stats->bc[i]);
+		
+		if(temp)
+			seq_print(m, "%s%s: %d\n", prefix,
+				binder_command_strings[i], temp);
+	}
+	
+	BUILD_BUG_ON(ARRAY_SIZE(stats->br) !=
+		ARRAY_SIZE(binder_return_strings));
+	for(i = 0; i < ARRAY_SIZE(stats->br); i++) {
+		int temp = atomic_inc(&stats->br[i]);
+		
+		if(temp)
+			seq_print(m, "%s%s: %d\n", prefix,
+				binder_return_strings[i], temp);
+				
+	}
+	BUILD_BUG_ON(ARRAY_SIZE(stats->obj_created) !=
+		ARRAY_SIZE(binder_objstat_strings));
+	BUILD_BUG_ON(ARRAY_SIZE(stats->obj_created) != 
+		ARRAY_SIZE(stats->obj_deleted));
+	for(i = 0; i < ARRAY_SIZE(stats->obj_created); i++) {
+		int created = atomic_read(&stats->obj_created[i]);
+		int deleted = atomic_read(&stats->obj_deleted[i]);
+		
+		if(created || deleted)
+			seq_print(m, "%s%s: active %d total %d\n",
+					prefix,
+					binder_objstat_strings[i],
+					created - deleted,
+					created);
+					
+	}
+	
+}
 
+static void print_binder_proc_stats(struct seq_file *m,
+				struct binder_proc *proc)
+{
+	struct binder_work *w;
+	struct binder_thread *thread;
+	struct rb_node *n;
+	int count, strong, weak, ready_threads;
+	size_t free_async_space = 
+		binder_alloc_get_free_async_space(&proc->alloc);
+	seq_printf(m, "proc %d\n", proc->pid);
+	seq_printf(m, "context %s\n", proc->context->name);
+	
+	count  = 0;
+	ready_threads = 0;
+	binder_inner_proc_lock(proc);
+	for( n = rb_first(&proc->threads); n != NULL; n = rb_next(n))
+		count++;
+	
+	list_for_each_entry(thread, &proc->waiting_threads, waiting_thread_node)
+		ready_threads++;
+		
+	seq_printf(m, " threads:　%d\n", count);
+	seq_printf(m, " requested threads: %d+ %d/%d\n",
+					" ready threads %d\n",
+					" free async space %zd\n", proc->requested_threads,
+					proc->requested_threads_started, proc->max_threads,
+					ready_threads,
+					free_async_space);
+	count = 0;
+	for(n = rb_first(&proc->nodes); n != NULL; n= rb_next(n))
+		count++;
+	
+	binder_inner_proc_unlock(proc);
+	seq_printf(m, "  nodes: %d\n", count);
+	count = 0;
+	strong = 0;
+	weak = 0;
+	binder_proc_lock(proc);
+	for(n = rb_first(&proc->refs_by_desc); n != NULL; n = rb_next(n)) {
+		struct binder_ref *ref = rb_entry(n, struct binder_ref,
+										rb_node_desc);
+		count++;
+		strong += ref->data.strong;
+		weak += ref->data.weak;
+	}
+	binder_proc_unlock(proc);
+	seq_printf(m, "   refs: %d s %d w %d\n", count, strong, weak);
+	
+	count = binder_alloc_get_allocated_count(&proc->alloc);
+	seq_printf(m, "  buffers:%d\n", count);
+	
+	binder_alloc_print_pages(m, &proc->alloc);
+	
+	count = 0;
+	binder_inner_proc_lock(proc);
+	list_for_each_entry(w, &proc->todo, entry) {
+		if(w->type == BINDER_WORK_TRANSACTION)
+			count++;
+	}
+	binder_inner_proc_unlock(proc);
+	seq_printf(m, "  pending transactions:%d\n", count);
+	print_binder_stats(m, " ", &proc->stats);
+}
+
+static int binder_state_show(struct seq_file *m, void *unused)
+{
+	struct binder_proc *proc;
+	struct binder_node *node;
+	struct binder_node *last_node = NULL;
+	
+	seq_puts(m, "binder state:\n");
+	
+	spin_lock(&binder_dead_nodes_lock);
+	if(!hlist_empty(&binder_dead_nodes))
+		seq_puts(m, " dead nodes:\n");
+	
+	hlist_for_each_entry(node, &binder_dead_nodes, dead_node) {
+		/**
+		** take a temporary reference on the node so it 
+		** survives and isn't removed from the list 
+		** while we print it 
+		**/
+		node->tmp_refs++;
+		spin_unlock(&binder_dead_nodes_lock);
+		if(last_node)
+			binder_put_node(last_node);
+		binder_node_lock(node);
+		print_binder_node_nilocked(m, node);
+		binder_node_unlock(node);
+		last_node = node;
+		spin_lock(&binder_dead_nodes_lock);
+	}
+	spin_unlock(&binder_dead_nodes_lock);
+	if(last_node)
+		binder_put_node(last_node);
+	
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(proc, &binder_procs, proc_node)
+		print_binder_proc(m, proc, 1);
+	mutex_unlock(&binder_procs_lock);
+	
+	return 0;
+}
+
+static int binder_stats_show(struct seq_file *m, void *unused)
+{
+	struct binder_proc *proc;
+	seq_puts(m, "  binder stats\n");
+	
+	print_binder_stats(m, "", &binder_stats);
+	
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(proc, &binder_procs, proc_node)
+		print_binder_proc_stats(m,proc);
+	mutex_unlock(&binder_procs_lock);
+	
+	return 0;
+}
+
+
+static int binder_transactions_show(struct seq_file *m, void *unused)
+{
+	struct binder_proc *proc;
+	
+	seq_puts(m,"binder transaction:\n");
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(proc, &binder_procs, proc_node)
+		print_binder_proc(m, proc, 0);
+	mutex_unlock(&binder_procs_lock);
+	
+	return 0;
+}
+
+static int binder_proc_show(struct seq_file *m, void *unused)
+{
+	struct binder_proc *itr;
+	int pid = (unsigned long)m->private;
+	
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(itr, &binder_procs, proc_node) {
+		if(itr->pid == pid) {
+			seq_puts(m, "binder proc state:\n");
+			print_binder_proc(m, itr, 1);
+		}
+	}
+	mutex_unlock(&binder_procs_lock);
+	return 0;
+}
+
+
+static void print_binder_transaction_log_entry(struct seq_file *m,
+					struct binder_transaction_log_entry *e)
+{
+	int debug_id = READ_ONCE(e->debug_id_done);
+	/**
+	** read barrier to guarantee debug_id_done read before
+	** we print the log values
+	**/
+	smp_rmb();
+	seq_print(m,
+		"%d: %s from %d:%d to %d: %d context %s node %d handle %d size %d:%d ret %d/%d != %d",
+		e->debug_id,(e->call_type == 2) ? "reply" :
+		((e->call_type == 1) ? "async" : "call"), e->from_proc,
+		e->from_thread, e->to_proc,e->to_thread, e->context_name,
+		e->to_node,e->target_handle, e->data_size, e->offsets_size,
+		e->return_error,e->return_error_param,
+		e->return_error_line);
+		
+	/**
+	** read-barrier to guarantee read of debug_id_done after
+	** done printing the fields of the entry
+	**/
+	smp_rmb();
+	seq_print(m, debug_id && debug_id == READ_ONCE(e->debug_id_done) ?
+		"\n" : "(incomplete)\n");
+}
 
 
 
