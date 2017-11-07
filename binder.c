@@ -5381,6 +5381,157 @@ static void print_binder_transaction_log_entry(struct seq_file *m,
 		"\n" : "(incomplete)\n");
 }
 
+static int binder_transaction_log_show(struct seq_file *m, void *unused)
+{
+	struct binder_transaction_log *log = m->private;
+	unsigned int log_cur = atomic_read(&log->cur);
+	unsigned int count;
+	unsigned int cur;
+	int i;
+	
+	count = log_cur + 1;
+	cur = count < ARRAY_SIZE(log->entry) && !log->full ?
+		0 : count % ARRAY_SIZE(log->entry);
+	if(count > ARRAY_SIZE(log->entry) || log->full)
+		count = ARRAY_SIZE(log->entry);
+	
+	for(i = 0; i < count; i++) {
+		unsigned int index = cur++ % ARRAY_SIZE(log->entry);
+		
+		print_binder_transaction_log_entry(m, &log->entry[index]);
+		
+	}
+	return 0;
+}
+
+static const struct file_operations binder_fops = {
+	.owner = THIS_MODULE,
+	.poll = binder_poll,
+	.unlocked_ioctl = binder_ioctl,
+	.mmap = binder_mmap,
+	.open = binder_open,
+	.flush = binder_flush,
+	.release = binder_release,
+};
+
+
+BINDER_DEBUG_ENTRY(state);
+BINDER_DEBUG_ENTRY(stats);
+BINDER_DEBUG_ENTRY(transactions);
+BINDER_DEBUG_ENTRY(transaction_log);
+
+static int __init init_binder_device(const char *name)
+{
+	int ret;
+	struct binder_device *binder_device;
+	
+	binder_device = kzalloc(sizeof(*binder_device), GFP_KERNEL);
+	if(!binder_device)
+		return -ENOMEM;
+	
+	binder_device->miscdev.fops = &binder_fops;
+	binder_device->miscdev.minor = MISC_DYNAMIC_MINOR;
+	binder_device->miscdev.name = name;
+	
+	binder_device->context.binder_context_mgr_uid = INVALID_UID;
+	binder_device->context.name = name;
+	
+	mutex_init(&binder_device->context.context_mgr_node_lock);
+	
+	ret = misc_register(&binder_device->miscdev);
+	if(ret < 0) {
+		kfree(binder_device);
+		return ret;
+	}
+	
+	hlist_add_head(&binder_device->hlist, &binder_devices);
+	
+	return ret;
+}
+
+static int __init binder_init(void)
+{
+	int ret;
+	char *device_name, *device_names, *device_tmp;
+	struct binder_device *device;
+	struct hlist_node *tmp;
+	
+	binder_alloc_shrinker_init();
+	
+	atomic_set(&binder_transaction_log.cur, ~0U);
+	atomic_set(&binder_transaction_log_failed.cur, ~0U);
+	
+	binder_debugfs_dir_entry_root = debugfs_create_dir("binder", NULL);
+	if(binder_debugfs_dir_entry_root)
+		binder_debugfs_dir_entry_proc = debugfs_create_dir("proc",
+				binder_debugfs_dir_entry_root);
+	if(binder_debugfs_dir_entry_root) {
+		debugfs_create_file("state",
+			S_IRUGO,
+			binder_debugfs_dir_entry_root,
+			NULL,
+			&binder_state_fops);
+		debugfs_create_file("stats",
+			S_IRUGO,
+			binder_debugfs_dir_entry_root,
+			NULL,
+			&binder_stats_fops);
+		debugfs_create_file("transactions",
+			S_IRUGO,
+			binder_debugfs_dir_entry_root,
+			NULL,
+			&binder_transactions_fops);
+		debugfs_create_file("transaction_log",
+			S_IRUGO,
+			binder_debugfs_dir_entry_root,
+			&binder_transaction_log,
+			&binder_transaction_log_fops);
+		debugfs_create_file("failed_transactoin_log",
+			S_IRUGO,
+			binder_debugfs_dir_entry_root,
+			&binder_transaction_log_failed,
+			&binder_transaction_log_fops);
+	}
+	/**
+	** Copy the module_parameter string, because we don't want to 
+	** tokenize it in-place
+	**/
+	device_names = kzalloc(strlen(binder_devices_param) + 1, GFP_KERNEL);
+	if(!device_name){
+		ret = -ENOMEM;
+		goto err_alloc_device_names_failed;
+	}
+	strcpy(device_names, binder_devices_param);
+	
+	device_tmp = device_names;
+	while((device_name = strsep(&device_tmp, ","))) {
+		ret = init_binder_device(device_name);
+		if(ret)
+			goto err_init_binder_device_failed;
+	}
+	
+	return ret;
+err_init_binder_device_failed:
+	hlist_for_each_entry_safe(device, tmp, &binder_devices, hlist) {
+		misc_deregister(&device->miscdev);
+		hlist_del(&device->hlist);
+		kfree(device);
+	}
+	kfree(device_names);
+	
+err_alloc_device_names_failed:
+	debugfs_remove_recursive(binder_debugfs_dir_entry_root);
+	
+	return ret;
+}
+
+device_initcall(binder_init);
+
+#define CREATE_TRACE_POINTS
+#include "binder_trace.h"
+
+MODULE_LICENSE("GPL v2");
+
 
 
 
