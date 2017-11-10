@@ -58,6 +58,120 @@ static size_t binder_alloc_buffer_size(struct binder_alloc *alloc,
 	return (u8 *)binder_buffer_next(buffer)->data - (u8 *)buffer->data;
 }
 
+static void binder_insert_free_buffer(struct binder_alloc *alloc,
+				struct binder_buffer *new_buffer)
+{
+	struct rb_node **p = &alloc->free_buffers.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_buffer *buffer;
+	size_t buffer_size;
+	size_t new_buffer_size;
+	
+	BUG_ON(!new_buffer->free);
+	
+	new_buffer_size = binder_alloc_buffer_size(alloc, new_buffer);
+	
+	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+		"%d: add free buffer, size %zd, at %pK\n",
+		alloc->pid, new_buffer_size, new_buffer);
+	
+	while(*p) {
+		parent = *p;
+		buffer = rb_entry(parent, struct binder_buffer, rb_node);
+		BUG_ON(!buffer->free);
+		
+		buffer_size = binder_alloc_buffer_size(alloc, buffer);
+		if(new_buffer_size < buffer_size)
+			p = &parent->rb_left;
+		else 
+			p = &parent->rb_right;
+	}
+	rb_link_node(&new_buffer->rb_node, parent, p);
+	rb_insert_color(&new_buffer->rb_node, &alloc->free_buffers);
+	
+}
+
+static void binder_insert_allocated_buffer_locked(
+				struct binder_alloc *alloc, struct binder_buffer *new_buffer)
+{
+	struct rb_node **p = &alloc->allocated_buffers.rb_node;
+	struct rb_node *parent = NULL;
+	struct binder_buffer *buffer;
+	
+	BUG_ON(new_buffer->free);
+	
+	while(*p) {
+		parent = *p;
+		buffer = rb_entry(parent, struct binder_buffer, rb_node);
+		BUG_ON(buffer->free);
+		
+		if(new_buffer->data < buffer->data)
+			p = &parent->rb_left;
+		else if(new_buffer->data > buffer->data)
+			p = &parent->rb_right;
+		else
+			BUG();
+			
+	}
+	rb_link_node(&new_buffer->rb_node, parent, p);
+	rb_insert_color(&new_buffer->rb_node, &alloc->allocated_buffers);
+}
+
+static struct binder_buffer *binder_alloc_prepare_to_free_locked(
+				struct binder_alloc *alloc,
+				uintptr_t user_ptr)
+{
+	struct rb_node *n = alloc->allocated_buffers.rb_node;
+	struct binder_buffer *buffer;
+	void *kern_ptr;
+	
+	kern_ptr = (void *)(user_ptr - alloc->user_buffer_offset);
+	
+	while(n) {
+		buffer = rb_entry(n, struct binder_buffer, rb_node);
+		BUG_ON(buffer->free);
+		
+		if(kern_ptr < buffer->data)
+			n = n->rb_left;
+		else if (kern_ptr > buffer->data)
+			n = n->rb_right;
+		else {
+			/**
+			** Guard against user threads attempting to 
+			** free the buffer twice
+			**/
+			if(buffer->free_in_progress) {
+				pr_err("%d:%d FREE_BUFFER u%016llx user freed buffer twice\n",
+				alloc->pid, current->pid,(u64)user_ptr);
+				return NULL;
+			}
+			buffer->free_in_progress = 1;
+			return buffer;
+		}
+	}
+	return NULL;
+}
+
+/**
+** binder_alloc_buffer_lookup() - get buffer given user ptr 
+** @alloc:  binder_alloc for this proc
+** @user_ptr: User pointer to buffer data 
+**
+** Validate userspace pointer to buffer data and return buffer corresponding to 
+** that user pointer. Search the rb tree for buffer that matchess user data pointer.
+**
+** Return: Pointer to buffer or NULL
+**/
+struct binder_buffer * binder_alloc_prepare_to_free(struct binder_alloc *alloc,
+							uintptr_t user_ptr)
+{
+	struct binder_buffer *buffer;
+	
+	mutex_lock(&alloc->mutex);
+	buffer = binder_alloc_prepare_to_free_locked(alloc, user_ptr);
+	mutex_unlock(&alloc->mutex);
+	return buffer;
+}
 
 
 
