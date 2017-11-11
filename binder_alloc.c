@@ -314,6 +314,206 @@ err_no_vma:
 	return vma ? -ENOMEM : -ESRCH;
 }
 
+struct binder_buffer *binder_alloc_new_buf_locked(struct binder_alloc *alloc,
+						size_t data_size,
+						size_t offsets_size,
+						size_t extra_buffers_size,
+						int is_async)
+{
+	struct rb_node *n = alloc->free_buffers.rb_node;
+	struct binder_buffer *buffer;
+	size_t buffer_size;
+	struct rb_node *best_fit = NULL;
+	void *has_page_addr;
+	void *end_page_addr;
+	size_t size, data_offsets_size;
+	int ret;
+	
+	if(alloc->vma == NULL) {
+		pr_err("%d: binder_alloc_buf, no vma\n",
+			alloc->pid);
+		return ERR_PTR(-ESRCH);
+	}
+	
+	data_offsets_size = ALGIN(data_size , sizeof(void *)) + 
+				ALGIN(offsets_size, sizeof(void *));
+	
+	if(data_offsets_size < data_size || data_offsets_size < offsets_size) {
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: got transaction with invalid size %zd-%zd\n",
+			alloc->pid, data_size, offsets_size);
+		return ERR_PTR(-EINVAL);
+	}
+	size = data_offsets_size + ALIGN(extra_buffers_size, sizeof(void *));
+	if(size  < data_offsets_size || size < extra_buffers_size) {
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: got transaction with invalid extra_buffers_size %zd\n",
+			alloc->pid, extra_buffers_size);
+		return ERR_PTR(-EINVAL);
+	}
+	if(is_async &&
+		alloc->free_async_space < size + sizeof(struct binder_buffer)) {
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: binder_alloc_buf size %zd failed, no async space left\n",
+			alloc->pid, size);
+		return ERR_PTR(-ENOSPC);
+	}
+	/** Pad 0-size buffers so they get assigned unique addresses **/
+	size = max(size, sizeof(void *));
+	
+	while(n) {
+		buffer = rb_entry(n, struct binder_buffer, rb_node);
+		BUG_ON(!buffer->free);
+		buffer_size = binder_alloc_buffer_size(alloc, buffer);
+		
+		if(size < buffer_size) {
+			best_fit = n;
+			n = n->rb_left;
+			
+		}
+		else if(size > buffer_size) {
+			n = n->rb_right;
+		} 
+		else {
+			best_fit = n;
+			break;
+		}
+	}
+	if(best_fit == NULL) {
+		size_t allocated_buffers = 0;
+		size_t largest_alloc_size = 0;
+		size_t total_alloc_size = 0;
+		size_t free_buffers = 0;
+		size_t largest_free_size = 0;
+		size_t total_free_size = 0;
+		
+		for(n = rb_first(&alloc->allocated_buffers; n != NULL;
+			n = rb_next(n)) {
+			buffer = rb_entry(n, struct binder_buffer , rb_node);
+			buffer_size = binder_alloc_buffer_size(alloc, buffer);
+			allocated_buffers++;
+			total_alloc_size += buffer_size;
+			if(buffer_size > largest_alloc_size)
+				largest_alloc_size = buffer_size;
+		}
+		
+		for(n = rb_first(&alloc->free_buffers); n != NULL;
+			n = rb_next(n)) {
+			buffer = rb_entry(n, struct binder_buffer, rb_node);
+			buffer_size = binder_alloc_buffer_size(alloc, buffer);
+			free_buffers++;
+			total_free_size += buffer_size;
+			if(buffer_size > largest_free_size)
+				largest_free_size = buffer_size;
+		}
+		pr_err("%d: binder_alloc_buf size %z failed, no addresses space\n",
+			alloc->pid, size);
+		pr_err("allocated: %zd (num:%zd largest:%zd),free:%zd(num:%zd largest: %zd)\n",
+			total_alloc_size, allocated_buffers, largest_alloc_size,
+			total_free_size, free_buffers,largest_free_size);
+		return ERR_PTR(-ENOSPC);
+	}
+	
+	if(n == NULL) {
+		buffer = rb_entry(best_fit, struct binder_buffer, rb_node);
+		buffer_size = binder_alloc_buffer_size(alloc, buffer);
+	}
+	
+	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+		"%d: binder_alloc_buf size %zd got buffer %pK size %zd\n",
+		alloc->pid, size, buffer, buffer_size);
+	has_page_addr = 
+		(void *)(((uintptr_t) buffer->data + buffer_size) & PAGE_MASK);
+	WARN_ON(n && buffer_size != size);
+	end_page_addr = (void *) PAGE_ALIGN((uintptr_t)buffer->data + size);
+	if(end_page_addr > has_page_addr)
+		end_page_addr = has_page_addr;
+	ret = binder_update_page_range(alloc,1,
+			(void *)PAGE_ALIGN((uintptr_t) buffer->data),end_page_addr, NULL);
+	if(ret)
+		return ERR_PTR(ret);
+	
+	if(buffer_size != size) {
+		struct binder_buffer *new_buffer;
+		
+		new_buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+		if(!new_buffer) {
+			pr_err("%s:%d failed to alloc new buffer struct\n",
+				__func__, alloc->pid);
+			goto err_alloc_buf_struct_failed;
+		}
+		new_buffer->data = (u8 *)buffer->data + size;
+		list_add(&new_buffer->entry, &buffer->entry);
+		new_buffer->free = 1;
+		binder_insert_free_buffer(alloc, new_buffer);
+		
+	}
+	rb_erase(best_fit, &alloc->free_buffers);
+	buffer->free = 0;
+	buffer->free_in_progress = 0;
+	binder_insert_allocated_buffer_locked(alloc, buffer);
+	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+		"%d: binder_alloc_buf size %zd got %pK\n",
+		alloc->pid, size, buffer);
+	buffer->data_size = data_size;
+	buffer->offsets_size = offsets_size;
+	buffer->async_transaction = is_async;
+	buffer->extra_buffers_size = extra_buffers_size;
+	if(is_async) {
+		alloc->free_async_space -= size + sizeof(struct binder_buffer);
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC_ASYNC,
+			"%d: binder_alloc_buf size %zd async free %zd\n",
+			alloc->pid, size, alloc->free_async_space);
+	}
+	return buffer;
+err_alloc_buf_struct_failed:
+	binder_update_page_range(alloc, 0,
+		(void *)PAGE_ALIGN((uintptr_t)buffer->data),
+		end_page_addr, NULL);
+	return ERR_PTR(-ENOMEM);
+}
+
+
+/**
+** binder_alloc_new_buf() - Allocate a new binder buffer
+** @alloc:     binder_alloc for this proc
+** @data_size : size of user data buffer
+** @offsets_size： user specified buffer offset
+** @extra_buffers_size:  size of extra space for meta-data(eg, security context)
+** @is_async:  buffer for async transaction
+**
+** Allocate a new buffer given the requested sizes, Returns
+** the kernel version of the buffer pointer. The size allocated
+** is the sum of the three given sizes(each rounded up to 
+** pointer-sized boundary)
+**
+** Return: The allocated buffer or %NULL if error
+**/
+struct binder_buffer *binder_alloc_new_buf(struct binder_alloc *alloc,
+							size_t data_size,
+							size_t offsets_size,
+							size_t extra_buffers_size,
+							int is_async)
+{
+	struct binder_buffer *buffer;
+	
+	mutex_lock(&alloc->mutex);
+	buffer = binder_alloc_new_buf_locked(alloc, data_size, offsets_size,
+					extra_buffers_size, is_async);
+	mutex_unlock(&alloc->mutex);
+	return buffer;
+}
+
+static void *buffer_start_page(struct binder_buffer *buffer)
+{
+	return (void *)((uintptr_t)buffer->data & PAGE_MASK);
+}
+
+static void *prev_buffer_end_page(struct binder_buffer *buffer)
+{
+	return (void *)(((uintptr_t)(buffer->data) - 1) & PAGE_MASK);
+}
+
 
 
 
