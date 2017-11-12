@@ -514,6 +514,316 @@ static void *prev_buffer_end_page(struct binder_buffer *buffer)
 	return (void *)(((uintptr_t)(buffer->data) - 1) & PAGE_MASK);
 }
 
+static void binder_delete_free_buffer(struct binder_alloc *alloc,
+				struct binder_buffer *buffer )
+{
+	struct binder_buffer *prev, *next = NULL;
+	bool to_free = true;
+	BUG_ON(alloc->buffers.next == &buffer->entry);
+	prev = binder_buffer_prev(buffer);
+	BUG_ON(!prev->free);
+	if(prev_buffer_end_page(prev) == buffer_start_page(buffer)) {
+		to_free = false;
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: merger free, buffer %pK share page with %pK\n",
+			alloc->pid, buffer->data, prev->data);
+			
+	}
+	if(!list_is_last(&buffer->entry, &alloc->buffers)) {
+		next = binder_buffer_next(buffer);
+		if(buffer_start_page(next) == buffer_start_page(buffer)) {
+			to_free = false;
+			binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+				"%d: merge free, buffer %pK share page with %pK\n",
+				alloc->pid,
+				buffer->data,
+				next->data);
+				
+		}
+	}
+	
+	if(PAGE_ALIGNED(buffer->data)) {
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: merge free, buffer start %pK is page aligned\n",
+			alloc->pid, buffer->data);
+		to_free = false;
+	}
+	
+	if(to_free) {
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: merge free , buffer %pK do not share page with %pK or %pK\n",
+			alloc->pid, buffer->data,
+			prev->data, next->data);
+		binder_update_page_range(alloc, 0, buffer_start_page(buffer),
+			buffer_start_page(buffer) + PAGE_SIZE,
+			NULL);
+	}
+	list_del(&buffer->entry);
+	kfree(buffer);
+}
+
+
+static void binder_free_buf_locked(struct binder_alloc *alloc,
+			struct binder_buffer *buffer)
+{
+	size_t size, buffer_size;
+	
+	buffer_size = binder_alloc_buffer_size(alloc, buffer);
+	
+	size = ALIGN(buffer->data_size, sizeof(void *)) + 
+		ALIGN(buffer->offsets_size, sizeof(void *)) +
+		ALIGN(buffer->extra_buffers_size, sizeof(void *));
+	
+	
+	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+		"%d: binder_free_buf %pK size %zd buffer_size %zd\n",
+		alloc->pid, buffer, size, buffer_size);
+	
+	BUG_ON(buffer->size);
+	BUG_ON(size > buffer_size);
+	BUG_ON(buffer->transaction != NULL);
+	BUG_ON(buffer->data < alloc->buffer);
+	BUG_ON(buffer->data > alloc->buffer + alloc->buffer_size);
+	
+	if(buffer->async_transaction) {
+		alloc->free_async_space += size + sizeof(struct binder_buffer);
+		
+		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+			"%d: binder_free_buf size %zd async free %zd\n",
+			alloc->pid, size, alloc->free_async_space);
+			
+	}
+	
+	binder_update_page_range(alloc, 0,
+		(void *)PAGE_ALIGN((uintptr_t)buffer->data),
+		(void *)(((uintptr_t)buffer->data + buffer_size) & PAGE_MASK),
+		NULL);
+	rb_erase(&buffer->rb_node, &alloc->allocated_buffers);
+	buffer->free = 1;
+	if(!list_is_last(&buffer->entry, &alloc->buffers)) {
+		struct binder_buffer *next = binder_buffer_next(buffer);
+		
+		if(next->free) {
+			rb_erase(&next->rb_node, &alloc->free_buffers);
+			binder_delete_free_buffer(alloc, next);
+		}
+	}
+	
+	if(alloc->buffers.next !=  &buffer->entry) {
+		struct binder_buffer *prev = binder_buffer_prev(buffer);
+		
+		if(prev->free) {
+			binder_delete_free_buffer(alloc, buffer);
+			rb_erase(&prev->rb_node, &alloc->free_buffers);
+			buffer = prev;
+		}
+	}
+	binder_insert_free_buffer(alloc, buffer);
+}
+
+/**
+** binder_alloc_free_buf() - free a binder buffer
+** @alloc:  binder_alloc for this proc
+** @buffer:  kernel pointer to buffer
+**
+** Free the buffer allocated via binder_alloc_new_buf()
+**/
+void binder_alloc_free_buf(struct binder_alloc *alloc,
+				struct binder_buffer *buffer)
+{
+	mutex_lock(&alloc->mutex);
+	binder_free_buf_locked(alloc, buffer);
+	mutex_unlock(&alloc->mutex);
+}
+
+/**
+** binder_alloc_mmap_handler() - map virtual address space for proc
+** @alloc: alloc struct for this proc
+** @vma:   vma passed to mmap()
+**
+** Called by binder_mmap() to initialize the space specified in 
+** vma for allocating binder buffers
+**
+** Return:
+**        0 == success
+**        -EBUSY = address space already mmaped
+**        -ENOMEM = failed to map memory to given address space
+**/
+int binder_alloc_mmap_handler(struct binder_alloc *alloc,
+						struct vm_area_struct *vma)
+{
+	int ret;
+	struct vm_struct *area;
+	const char *failure_string;
+	struct binder_buffer *buffer;
+	
+	mutex_lock(&binder_alloc_mmap_lock);
+	if(alloc->buffer) {
+		ret = -EBUSY;
+		failure_string = "already mmapped";
+		goto err_already_mapped;
+	}
+	area = get_vm_area(vma->vm_end - vma->vm_start , VM_IOREMAP);
+	if(area == NULL) {
+		ret = -ENOMEM;
+		failure_string = "get_vm_area";
+		goto err_get_vm_area_failed;
+	}
+	alloc->buffer = area->addr;
+	alloc->user_buffer_offset = 
+		vma->vm_start - (uintptr_t)alloc->buffer;
+	mutex_unlock(&binder_alloc_mmap_lock);
+	
+#ifdef CONFIG_CPU_CACHE_VIPT
+	if(cache_is_vipt_aliasing()) {
+		while(CACHE_COLOUR(
+			(vma->vm_start  ^ (uint32_t)alloc->buffer))) {
+			pr_info("%s:%d %lx-%lx maps %pK bad alignment\n",
+			__func__, alloc->pid, vma->vm_start,
+			vma->vm_end, alloc->buffer);
+			vma->vm_start += PAGE_SIZE;
+		}
+	}
+#endif
+	alloc->pages = kzalloc(sizeof(alloc->pages[0]) * 
+		((vma->vm_end - vma->vm_start )/ PAGE_SIZE),
+		GFP_KERNEL);
+	if(alloc->pages == NULL) {
+		ret = -ENOMEM;
+		failure_string = "alloc page array";
+		goto err_alloc_page_failed;
+		
+	}
+	alloc->buffer_size = vma->vm_end - vma->vm_start;
+	
+	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+	if(!buffer) {
+		ret = -ENOMEM;
+		failure_string = "alloc buffer struct";
+		goto err_alloc_buf_struct_failed;
+	}
+	buffer->data = alloc->buffer;
+	list_add(&buffer->entry, &alloc->buffers);
+	buffer->free = 1;
+	binder_insert_free_buffer(alloc, buffer);
+	alloc->free_async_space = alloc->buffer_size / 2;
+	barrier();
+	alloc->vma = vma;
+	alloc->vma_vm_mm = vma->vm_mm;
+	
+	return 0;
+	
+err_alloc_buf_struct_failed:
+	kfree(alloc->pages);
+	alloc_pages = NULL;
+	
+err_alloc_pages_failed:
+	mutex_lock(&binder_alloc_mmap_lock);
+	vfree(alloc->buffer);
+	alloc->buffer = NULL;
+err_get_vm_area_failed:
+err_already_mapped:
+	mutex_unlock(&binder_alloc_mmap_lock);
+	pr_err("%s: %d %lx-%lx %s failed %d\n", __func__,
+		alloc->pid, vma->vm_start, vma->vm_end, failure_string, ret);
+
+		
+	return ret;
+}
+
+void binder_alloc_deferred_release(struct binder_alloc *alloc)
+{
+	struct rb_node *n;
+	int buffers, page_count;
+	struct binder_buffer *buffer;
+	
+	BUG_ON(alloc->vma);
+	
+	buffers = 0;
+	
+	mutex_lock(&alloc->mutex);
+	while((n = rb_first(&alloc->allocated_buffers))) {
+		buffer = rb_entry(n, struct binder_buffer, rb_node);
+		
+		/** Transaction should already have been freed **/
+		BUG_ON(buffer->transaction);
+		
+		binder_free_buf_locked(alloc, buffer);
+		buffers++;
+	}
+	
+	while(!list_empty(&alloc->buffers)) {
+		buffer = list_first_entry(&alloc->buffers,
+				struct binder_buffer, entry);
+		WARN_ON(!buffer->free);
+		
+		list_del(&buffer->entry);
+		WARN_ON_ONCE(!list_empty(&alloc->buffers));
+		kfree(buffer);
+	}
+	
+	page_count = 0;
+	if(alloc->pages) {
+		int i;
+		
+		for(i = 0; i < alloc->buffer_size / PAGE_SIZE; i++) {
+			void *page_addr;
+			bool on_lru;
+			
+			if(!alloc->pages[i].page_ptr)
+				continue;
+			on_lru = list_lru_del(&binder_alloc_lru,
+					&alloc->pages[i].lru);
+			page_addr = alloc->buffer +  i * PAGE_SIZE;
+			binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+				"%s:%d:page %d at %pK %s\n",
+				__func__, alloc->pid, i, page_addr,
+				on_lru ? "on lru" : "active");
+			unmap_kernel_range((unsigned long)page_addr, PAGE_SIZE);
+			__free_page(alloc->pages[i].page_ptr);
+			page_count++;
+		}
+		kfree(alloc->pages);
+		vfree(alloc->buffer);
+	}
+	mutex_unlock(&alloc->mutex);
+	
+	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
+		"%s: %d buffers %d, pages %d\n",
+		__func__, alloc->pid, buffers, page_count);
+}
+
+static void print_binder_buffer(struct seq_file *m, const char *prefix,
+			struct binder_buffer *buffer)
+{
+	seq_print(m, "%s %d: %pK size %zd:%zd : %zd %s\n",
+		prefix, buffer->debug_id, buffer->data,
+		buffer->data_size, buffer->offsets_size,
+		buffer->extra_buffers_size,
+		buffer->transaction ? "active" : "delivered");
+}
+
+
+/**
+** binder_alloc_print_allocated() - print buffer info
+** @m: seq_file for output via seq_printf()
+** @alloc: binder_alloc for this proc
+**
+** Prints information about every buffer associated with
+** the binder_alloc state to the given seq_file
+**/
+void binder_alloc_print_allocated(struct seq_file *m,
+			struct binder_alloc *alloc)
+{
+	struct rb_node *n;
+	mutex_lock(&alloc->mutex);
+	for(n = rb_first(&alloc->allocated_buffers); n != NULL; n = rb_next(n))
+		print_binder_buffer(m, "  buffer",
+			rb_entry(n, struct binder_buffer, rb_node));
+	mutex_unlock(&alloc->mutex);
+}
+
+
 
 
 
