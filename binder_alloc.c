@@ -823,6 +823,181 @@ void binder_alloc_print_allocated(struct seq_file *m,
 	mutex_unlock(&alloc->mutex);
 }
 
+/**
+** binder_alloc_print_pages() - print page usage
+** @m:  seq_file for output via seq_printf()
+** @alloc: binder_alloc for this proc
+**/
+void binder_alloc_print_pages(struct seq_file *m,
+				struct binder_alloc *alloc)
+{
+	struct binder_lru_page *page;
+	int i;
+	int active = 0;
+	int lru = 0;
+	int free = 0;
+	
+	mutex_lock(&alloc->mutex);
+	for(i = 0;i < alloc->buffer_size / PAGE_SIZE; i++)
+	{
+		page = &alloc->pages[i];
+		if(!page->page_ptr)
+			free++;
+		else if (list_empty(&page->lru))
+			active++;
+		else
+			lru++;
+	}
+	mutex_unlock(&alloc->mutex);
+	seq_printf(m, "  pages: %d: %d:%d\n", active, lru, free);
+	
+}
+
+/**
+** binder_alloc_get_allocated_count() - return count of buffers
+** @alloc: binder_alloc for this proc
+**
+** Return: count of allocated buffers
+**/
+int binder_alloc_get_allocated_count(struct binder_alloc *alloc)
+{
+	struct rb_node *n;
+	int count = 0;
+	
+	mutex_lock(&alloc->mutex);
+	for(n = rb_first(&alloc->allocated_buffers); n != NULL; n = rb_next(n))
+		count++;
+	mutex_unlock(&alloc->mutex);
+	return count;
+}
+
+/**
+** binder_alloc_vma_close() - invalidate address space
+** @alloc: binder_alloc for this proc
+**
+** Called from binder_vma_close() when releasing address space.
+** Clears alloc->vma to prevent new incoming transactions from
+** allocating more buffers.
+**/
+void binder_alloc_vma_close(struct binder_alloc *alloc)
+{
+	WRITE_ONCE(alloc->vma, NULL);
+	WRITE_ONCE(alloc->vma_vm_mm, NULL);
+}
+
+/**
+** binder_alloc_free_page() - shrinker callback to free pages
+** @item: item to free 
+** @lock: lock protecting the item
+** @cb_arg: callback argument
+**
+** Called from list_lru_walk() in binder_shrink_scan() to free 
+** up pages when the system is under memory pressure.
+**/
+enum lru_state binder_alloc_free_page(struct list_head *item,
+					struct list_lru_one *lru,
+					spinlock_t *lock,
+					void *cb_arg)
+{
+	struct mm_struct *mm = NULL;
+	struct binder_lru_page *page = container_of(item,
+									struct binder_lru_page,
+									lru);
+	struct binder_alloc *alloc;
+	uintptr_t page_addr;
+	size_t index;
+	
+	alloc = page->alloc;
+	if(!mutex_trylock(&alloc->mutex))
+		goto err_get_alloc_mutex_failed;
+	if(!page->page_ptr)
+		goto err_page_already_freed;
+	
+	index = page - alloc->pages;
+	page_addr = (uintptr_t)alloc->buffer + index * PAGE_SIZE;
+	if(alloc->vma) {
+		mm = get_task_mm(alloc->tsk);
+		if(!mm)
+			goto err_get_task_mm_failed;
+		if(!down_write_trylock(&mm->mmap_sem))
+			goto err_down_write_mmap_sem_failed;
+		
+		trace_binder_unmap_user_start(alloc, index);
+		
+		zap_binder_unmap_user_end(alloc, index);
+		
+		up_write(&mm->mmap_sem);
+		mmput(mm);
+	}
+	
+	trace_binder_unmap_kernel_start(alloc, index);
+	
+	unmap_kernel_range(page_addr, PAGE_SIZE);
+	__free_page(page->page_ptr);
+	
+	trace_binder_unmap_kernel_end(alloc, index);
+	
+	list_lru_isolate(lru, item);
+	
+	mutex_unlock(&alloc->mutex);
+	
+	return LRU_REMOVED;
+err_down_write_mmap_sem_failed:
+	mmput(mm);
+err_get_task_mm_failed:
+err_page_already_freed:
+	mutex_unlock(&alloc->mutex);
+err_get_alloc_mutex_failed:
+	return LRU_SKIP;
+}
+
+static unsigned long
+binder_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+{
+	unsigned long ret = list_lru_count(&binder_alloc_lru);
+	return ret;
+}
+
+static unsigned long
+binder_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+{
+	unsigned long ret;
+	
+	ret = list_lru_walk(&binder_alloc_lru, binder_alloc_free_page,
+				NULL, sc->nr_to_scan);
+	return ret;
+}
+
+struct shrinker binder_shrinker = {
+	.count_objects = binder_shrink_count,
+	.scan_objects = binder_shrink_scan,
+	.seeks = DEFAULT_SEEKS,
+};
+
+/**
+** binder_alloc_init() - called by binder_open() for per-proc initialization
+** @alloc: binder_alloc for this proc
+*
+** called from  binder_open() to initialize binder_alloc fields for 
+** new binder proc
+**/
+void binder_alloc_init(struct binder_alloc *alloc)
+{
+	alloc->tsk = current->group_leader;
+	alloc->pid = current->group_leader->pid;
+	mutex_init(&alloc->mutex);
+	INIT_LIST_HEAD(&alloc->buffers);
+}
+
+void binder_alloc_shrinker_init(void)
+{
+	list_lru_init(&binder_alloc_lru);
+	register_shrinker(&binder_shrinker);
+}
+
+
+
+
 
 
 
