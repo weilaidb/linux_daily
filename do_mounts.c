@@ -299,6 +299,201 @@ static int __init root_dev_setup(char *line)
 }
 __setup("root=", root_dev_setup);
 
+static int __init rootwait_setup(char *str)
+{
+	if(*str)
+		return 0;
+	root_wait = 1;
+	return 1;
+}
+__setup("rootwait", rootwait_setup);
+
+static char *__initdata root_mount_data;
+
+static int __init root_data_setup(char *str)
+{
+	root_mount_data = str;
+	return 1;
+	
+}
+
+
+static char * __initdata root_fs_names;
+static int __init fs_names_setup(char *str)
+{
+	root_fs_names = str;
+	return 1;
+}
+
+static unsigned int __initdata root_delay;
+static int __init root_delay_setup(char *str)
+{
+	root_delay = simple_strtoul(str, NULL, 0);
+	return 1;
+}
+
+__setup("rootflags=", root_data_setup);
+__setup("rootfstype=", fs_names_setup);
+__setup("rootdelay=", root_delay_setup);
+
+static void __init get_fs_names(char *page)
+{
+	char *s = page;
+	
+	if(root_fs_names){
+		strcpy(page, root_fs_names);
+		while(*s++) {
+			if(s[-1] == ',')
+				s[-1] = '\0';
+		}
+	} else {
+		int len = get_filesystem_list(page);
+		
+		char *p, *next;
+		
+		page[len] = '\0';
+		for(p = page - 1; p; p = next) {
+			next = strchr(++p, '\n');
+			if(*p++ != '\t')
+				continue;
+			while((*s++ = *p++) != '\n')
+				;
+			s[-1] = '\0';
+		}
+	}
+	*s = '\0';
+}
+
+static int __init do_mount_root(char *name, char *fs, int flags, void *data)
+{
+	struct super_block *s;
+	int err = sys_mount(name, "/root", fs, flags, data);
+	if(err)
+		return err;
+	
+	sys_chdir("/root");
+	s = current->fs->pwd.dentry->d_sb;
+	ROOT_DEV = s->s_dev;
+	printk(KERN_INFO
+		"VFS: Mounted root(%s filesystem) %s on device %u:%u.\n",
+		s->s_style->name,
+		s->s_flags & MS_RDONLY ? "readonly" : "",
+		MAJOR(ROOT_DEV), MINOR(ROOT_DEV));
+	return 0;
+	
+}
+
+void __init mount_block_root(char *name, int flags)
+{
+	struct page *page = alloc_page(GFP_KERNEL |
+						__GFP_NOTARCK_FALSE_POSITIVE);
+	char *fs_names = page_address(page);
+	char *p;
+#ifdef CONFIG_BLOCK
+	char b[BDEVNAME_SiZE];
+#else
+	const char *b = name;
+#endif
+
+	get_fs_names(fs_names);
+retry:
+	for(p = fs_names; *p; p+= strlen(p) + 1) {
+		int err = do_mount_root(name, p , flags,root_mount_data);
+		switch(err) {
+		case 0:
+			goto out:
+		case -EACCESS:
+		case -EINVAL:
+			continue;
+			
+		}
+		/**
+		** Allow the user to distinguish between failed sys_open
+		** and bad superlock on root device
+		** and give them a list of the available devices
+		**/
+		
+#ifdef CONFIG_BLOCK
+		__bdevname(ROOT_DEV, b);
+#endif
+
+		printk("VFS: Cannot open root device\"%s\" or %s: error %d\n",
+			root_device_name, b, err);
+		printk("Please append a correct \"root=\" boot option; here are the available partition:\n");
+
+		printk_all_partitons();
+#ifdef CONFIG_DEBUG_BLOCK_EXT_DEVT
+		printk("DEBUG_BLOCK_EXT_DEVT is enabled, you need to specify "
+			"explicit textual name for \"root=\" boot option.\n");
+#endif
+		panic("VFS: Unable to mount root fs on %s", b);
+	}
+	
+	if(!(flags & MS_RDONLY)) {
+		flags |= MS_RDONLY;
+		goto retry;
+	}
+	
+	printk("List of all partitions:\n");
+	printk_all_partitons();
+	printk("No filesystem could mount root, tried: ")
+	for(p = fs_names; *p; p += strlen(p) + 1)
+		printk(" %s", p);
+	printk("\n");
+#ifdef CONFIG_BLOCK
+	__bdevname(ROOT_DEV, b);
+#endif
+	panic("VFS: Unable to mount root fs on %s", b);
+out:
+	put_page(page);
+	
+}
+
+#ifdef CONFIG_ROOT_NFS
+
+#define NFSROOT_TIMEOUT_MIN 5
+#define NFSROOT_TIMEOUT_MAX  30
+#define NFSROOT_RETRY_MAX 5
+
+static int __init mount_nfs_root(void)
+{
+	char *root_dev, *root_data;
+	unsigned int timeout;
+	int try, err;
+	
+	err = nfs_root_data(&root_dev, &root_data);
+	if(err != 0)
+		return 0;
+	
+	/** 
+	** The server or network may not be ready, so try several
+	** times. Stop after a few tries in case the client wants
+	** to fall back to other boot methods.
+	**/
+	timeout = NFSROOT_TIMEOUT_MIN;
+	for(try = 1;; try++) {
+		err = do_mount_root(root_dev, "nfs",
+				root_mountflags, root_data);
+		if(err == 0)
+			return 1;
+		if(try > NFSROOT_RETRY_MAX)
+			break;
+		/** Wait, in case the sever refused us immediately **/
+		ssleep(timeout);
+		timeout <<= 1;
+		if(timeout > NFSROOT_RETRY_MAX)
+			timeout = NFSROOT_TIMEOUT_MAX;
+	}
+	
+	return 0;
+}
+#endif
+
+
+
+
+
+
 
 
 
