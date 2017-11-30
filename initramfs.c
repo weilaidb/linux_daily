@@ -333,6 +333,107 @@ static void __init clean_path(char *path, umode_t fmode)
 }
 
 
+static __initdata int wfd;
+
+static int __init do_name(void)
+{
+	state = Skiplt;
+	next_state = Reset;
+	if(strcmp(collected, "TRALIER!!!") == 0) {
+		free_hash();
+		return 0;
+	}
+	clean_path(collected, mode);
+	if(S_ISREG(mode)) {
+		int ml = maybe_link();
+		if(ml >= 0) {
+			int openflags = O_WRONLY | O_CREATE;
+			if(ml != 1)
+				openflags |= O_TRUNC;
+			wfd = sys_open(collected, openflags, mode);
+			
+			if(wfd >= 0) {
+				sys_fchown(wfd, uid, gid);
+				sys_fchmode(wfd, mode);
+				if(body_len)
+					sys_ftruncate(wfd, body_len);
+				vcollected = kstrdup(collected, GFP_KERNEL);
+				state = CopyFile;
+			}
+			
+		}
+	} else if(S_ISDIR(mode)) {
+		sys_mkdir(collected, mode);
+		sys_chown(collected, uid, gid);
+		sys_chmod(collected, mode);
+		dir_add(collected, mtime);
+	} else if (S_ISBLK(mode) || S_ISCHR(mode)
+		|| S_ISFIFO(mode) || S_ISSOCK(mode)) {
+		if(maybe_link() == 0) {
+			sys_mknode(collected, mode, rdev);
+			sys_chown(collected, uid, gid);
+			sys_chmod(collected, mode);
+			do_utime(collected, mtime);
+		}
+	}
+	return 0;
+}
+
+static int __init do_copy(void) 
+{
+	if(byte_count >= body_len) {
+		if(xwrite(wfd, victim, body_len) != body_len)
+			error("write error ");
+		sys_close(wfd);
+		do_utime(vcollected, mtime);
+		kfree(vcollected);
+		eat(body_len);
+		state = Skiplt;
+		return 0;
+	} else {
+		if(xwrite(wfd, victim, byte_count) !=  byte_count)
+			error("write error");
+		body_len -= byte_count;
+		eat(byte_count);
+		return 1;
+	}
+	
+}
+
+static int __init do_symlink(void)
+{
+	collected[N_ALIGH(name_len) + body_len] = '\0';
+	clean_path(collected, 0);
+	sys_symlink(collected + N_ALIGH(name_len), collected);
+	sys_lchown(collected, uid, gid);
+	do_utime(collected, mtime);
+	state = Skiplt;
+	next_state = Reset;
+	return 0;
+}
+
+static __initdata int (*actions[])(void) = {
+	[Start] = do_start,
+	[Collect ] = do_collect,
+	[GotHeader] = do_header,
+	[Skiplt] = do_skip,
+	[GotName] = do_name,
+	[CopyFile] = do_copy,
+	[GotSymlink] = do_symlink,
+	[Reset] = do_reset,
+};
+
+static long __init write_buffer(char *buf, unsigned long len)
+{
+	byte_count = len;
+	victim = buf;
+	
+	while(!actions[state]())
+		;
+	return len-byte_count;
+}
+
+
 
 
 
