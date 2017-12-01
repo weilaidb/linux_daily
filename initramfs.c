@@ -433,9 +433,199 @@ static long __init write_buffer(char *buf, unsigned long len)
 	return len-byte_count;
 }
 
+static long __init flush_buffer(void *bufv, unsigned long len)
+{
+	char *buf = (char *)bufv;
+	long written;
+	long origLen = len;
+	if(message)
+		return -1;
+	while((written = write_buffer(buf, len)) < len && !message)
+	{
+		char c = buf[written];
+		if(c == '0') {
+			buf += written;
+			len -= written;
+			state = Start;
+		} else if (c == 0) {
+			buf += written;
+			len -= written;
+			state = Reset;
+		} else 
+			error("junk in compressed archinve");
+	}
+	return origLen;
+}
 
+static unsigned long my_inptr; /** index of next byte to be processed in inbuf **/
 
+#include <linux/decompress/generic.h>
+static char * __init unpack_to_rootfs(char *buf, unsigned long len)
+{
+	long written;
+	decompress_fn decompress;
+	const char *compress_name;
+	static __initdata char msg_buf[64];
+	
+	header_buf = kmalloc(110, GFP_KERNEL);
+	symlink_buf = kmalloc(PATH_MAX + N_ALIGH(PATH_MAX) + 1, GFP_KERNEL);
+	name_buf = kmalloc(N_ALIGH(PATH_MAX), GFP_KERNEL);
+	
+	if(!header_buf || !symlink_buf || !name_buf)
+		panic("can't allocate buffers");
+	
+	state = Start;
+	this_header = 0;
+	message = NULL;
+	while(!message && len) {
+		loff_t saved_offset = this_header;
+		if(*buf  == '0' && !(this_header & 3)) {
+			state = Start;
+			written = write_buffer(buf, len);
+			buf += written;
+			len -= written;
+			continue;
+		}
+		if(!*buf) {
+			buf++;
+			len--;
+			this_header++;
+			continue;
+		}
+		this_header = 0;
+		decompress = decompress_method(buf, len, &compress_name);
+		pr_debug("Detected %s compressed data\n", compress_name);
+		
+		if(decompress) {
+			int res = decompress(buf, len ,NULL, flush_buffer, NULL,
+								&my_inptr, error);
+			if(res)
+				error("decompress failed");
+			
+		} else if (compress_name) {
+			if(!message){
+				snprintf(msg_buf, sizeof msg_buf,
+					"compression method %s not configured",
+					compress_name);
+				message = msg_buf;
+			}
+		} else 
+			error("junk in compressed archinve");
+		if(state != Reset)
+			error("junk in compressed archinve");
+		this_header = saved_offset + my_inptr;
+		buf += my_inptr;
+		len -= my_inptr;
+	}
+	
+	dir_utime();
+	kfree(name_buf);
+	kfree(symlink_buf);
+	kfree(header_buf);
+	return message;
+	
+}
 
+static int __initdata do_retain_initrd;
+
+static int __init retain_initrd_param(char *str)
+{
+	if(*str)
+		return 0;
+	do_retain_initrd = 1;
+	return 1;
+}
+
+__setup("retain_initrd", retain_initrd_param);
+
+extern char __initramfs_start[];
+extern unsigned long _initramfs_size;
+#include <linux/initrd.h>
+#include <linux/kexec.h>
+
+static void __init free_initrd(void)
+{
+#ifdef CONFIG_KEXEC_CORE
+	unsigned long crashk_start = (unsigned long)__va(crashk_res.start);
+	unsigned long crashk_end = (unsigned long)__va(crashk_res.end);
+	
+#endif
+	if(do_retain_initrd)
+		goto skip;
+	
+#ifdef CONFIG_KEXEC_CORE
+	/**
+	** If the initrd region is overlapped with crashkernel region,
+	** free only memory that is not part of crashkernel region.
+	**/
+	if(initrd_start < crashk_end && initrd_end > crashk_start) {
+		/** 
+		** Initialize initrd memory region since  the kexec boot does
+		** not do.
+		***/
+		memset((void *)initrd_start, 0, initrd_end - initrd_start);
+		if(initrd_start < crashk_start)
+			free_initrd_mem(initrd_start, crashk_start);
+		if(initrd_end > crashk_end)
+			free_initrd_mem(crashk_end, initrd_end);
+		
+	}else
+#endif
+		free_initrd_mem(initrd_start, initrd_end);
+skip:
+	initrd_start = 0;
+	initrd_end = 0;
+}
+
+#ifdef CONFIG_BLK_DEV_RAM
+#define BUF_SIZE 1024
+
+static void __init clean_rootfs(void)
+{
+	int fd;
+	void *buf;
+	struct linux_dirent64 *dirp;
+	int num;
+	
+	fd = sys_open("/", O_RDONLY, 0);
+	WARN_ON(fd < 0);
+	if(fd < 0)
+		return;
+	buf = kzalloc(BUF_SIZE, GFP_KERNEL);
+	WARN_ON(!buf);
+	if(!buf) {
+		sys_close(fd);
+		return;
+	}
+	
+	dirp = buf;
+	num = sys_getdents64(fd, dirp, BUF_SIZE);
+	while(num > 0) {
+		while(num > 0) {
+			struct kstat st;
+			int ret;
+			
+			ret = vfs_lstat(dirp->d_name, &st);
+			WARN_ON_ONCE(ret);
+			if(!ret) {
+				if(S_ISDIR(st.mode))
+					sys_rmdir(dirp->d_name);
+				else
+					sys_unlink(dirp->d_name);
+			}
+			num -= dirp->d_reclen;
+			dirp = (void *)dirp + dirp->d_reclen;
+		}
+		dirp = buf;
+		memset(buf, 0, BUF_SIZE);
+		num = sys_getdents64(fd, dirp, BUF_SIZE);
+		
+	}
+	
+	sys_close(fd);
+	kfree(buf);
+}
+#endif
 
 
 
