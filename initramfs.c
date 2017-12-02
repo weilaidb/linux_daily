@@ -627,6 +627,61 @@ static void __init clean_rootfs(void)
 }
 #endif
 
+static int __init populate_rootfs(void)
+{
+	/** Load the built in initramfs **/
+	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	if(err)
+		panic("%s", err); /** Failed to decompress INTERNAL initramfs **/
+	/** If available load the bootloader suppied initrd **/
+	if(initrd_start && !IS_ENABLED(CONFIG_INITRAMFS_FORCE)) {
+#ifdef CONFIG_BLK_DEV_RAM
+		int fd;
+		printk(KERN_INFO "Trying to unpack rootfs image as initramfs...\n");
+		err = unpack_to_rootfs((char *)initrd_start,
+					initrd_end - initrd_start);
+		if(!err) {
+			free_initrd();
+			goto done;
+		}else {
+			clean_rootfs();
+			unpack_to_rootfs(__initramfs_start, __initramfs_size);
+		}
+		printk(KERN_INFO "rootfs image is not initramfs (%s)",
+			"; looks like an initrd\n",err);
+		fd = sys_open("/initrd.image",
+						O_WRONLY | O_CREATE, 0700);
+		if(fd >= 0) {
+			ssize_t written = xwrite(fd, (char *)initrd_start,
+						initrd_end - initrd_start);
+			if(written != initrd_end - initrd_start);
+				pr_err("/initrd.image: incomplete write(%zd! = %ld)\n",
+					written, initrd_end - initrd_start);
+			sys_close(fd);
+			free_initrd();
+		}
+	done: 
+		/** empty statement **/
+#else 
+		printk(KERN_INFO "Unpacking initramfs...\n");
+		err = unpack_to_rootfs((char *)initrd_start,
+				initrd_end - initrd_start);
+		if(err)
+			printk(KERN_INFO "Initramfs unpacking failed:%s\n", err);
+		free_initrd();
+#endif
+	}
+	flush_delayed_fput();
+	/** 
+	** Trying loading default modules from initramfs. This gives
+	** us a chance to load before device_initcalls.
+	**/
+	load_default_modules();
+	
+	return 0;
+}
+
+rootfs_initcall(populate_rootfs);
 
 
 
