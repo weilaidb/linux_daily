@@ -448,9 +448,46 @@ config TASKSTATS
 		Say N if unsure.
 		
 
+config TASK_DELAY_ACCT
+	bool "Enable per-task delay accounting"
+	depends on TASKSTATS
+	select SCHED_INFO
+	help
+		Collect information on time spent by a task waiting for system
+		resources like cpu, synchronous block I/O completion and swapping
+		in pages. Such statistics can help in setting a task's priorites
+		relative to other tasks for cpu, io, rss limits etc.
+		
+		Say N if unsure.
+		
+config TASK_XACCT
+	bool "Enable extended accounting over taskstats"
+	depends on TASKSTATS
+	help
+		Collect extended task accounting data and send the data 
+		to userland for processing over the taskstats interface.
+		
+	Say N if unsure.
+	
+	
+config TASK_IO_ACCOUNTING
+	bool "Enable per-task storage I/O accounting"
+	depends on TASK_XACCT
+	help
+		Collect information on the number of bytes of storage I/O which this 
+		task has caused.
+		
+		Say N if unsure.
+		
+endmenu # "CPU/Task time and stats accounting"
 
-
-
+source "kernel/rcu/Kconfig"
+		
+config BUILD_BIN2C
+	bool
+	default n
+	
+	
 
 
 
