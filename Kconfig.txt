@@ -1019,7 +1019,303 @@ config RELAY
 
 
 
+config BLK_DEV_INITRD
+	bool "Inital RAM filesystem and RAM disk(initramfs/initrd) support"
+	depends on BROKEN || !FRV
+	help 
+		The initial RAM filesystem is a ramfs which is loaded by the 
+		boot loader(loadlin or lilo) and that is mounted as root 
+		before the normal boot procedule. It is typically used to 
+		load modules needed to mount the "real" root file system,
+		ect. See<file:Documentation/admin-guide/initrd.rst> for details.
+		
+		If RAM disk support(BLK_DEV_RAM) is also included, this 
+		also enables initial RAM disk(initrd) support and adds 
+		15 Kbytes(more on some other architectures) to the kernel size.
+		
+		If unsure say Y.
+		
+		
+if BLK_DEV_INITRD
 
+source "usr/Kconfig"
+
+endif
+
+choice 
+	prompt "Compiler optimization level"
+	default CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
+	
+config CC_OPTIMIZE_FOR_PERFORMANCE
+	bool "Optimize for performance"
+	help 
+		This is the default optimization level for the kernel, building
+		with the "-O2" compiler flag for best performance and most 
+		helpful compile-time warnings.
+		
+config CC_OPTIMIZE_FOR_SIZE
+	bool "Optimize for size"
+	help 
+		Enabling this option will pass "-Os" instead of "-O2" to 
+		your compiler resulting in a smaller kernel.
+		
+		If unsure, say N.
+		
+		
+endchoice
+
+config SYSCTL
+	bool 
+	
+config ANON_INODES
+	bool 
+	
+config HAVE_UID16
+	bool 
+	
+config SYSCTL_EXCEPTION_TRACE
+	bool 
+	help
+		Enable support for /proc/sys/debug/exception-trace.
+		
+config SYSCTL_ARCH_UNALIGH_NO_WARN
+	bool 
+	help 
+		Enable support for /proc/sys/kernel/ignore-unaligned-usertrap
+		Allows arch to define/use #no_unaligned_warning to possibly warn 
+		about unaligned access emulation going on under the hood.
+		
+config SYSCTL_ARCH_UNALIGH_ALLOW
+	bool 
+	help 
+		Enable support for /proc/sys/kernel/unaligned-trap
+		Allows arches to define/usr@unaligned_enabled to runtime toggle
+		the unaligned access emulation.
+		see arch/parisc/kernel/unaligned.c for reference 
+		
+config HAVE_PCSPKR_PLATFORM
+	bool 
+	
+#interpreter that classic socket filters depend on 
+config BPF 
+	bool 
+	
+menuconfig EXPERT 
+	bool "Configure standard kernel features(expert users)"
+	#Unhide debug options, to make the on-by-default options visible 
+	select DEBUG_KERNEL
+	help 
+		This option allows certain base kernel options and settings 
+		to be disabled or tweaked. This is for specialized
+		environments which can tolerate a "non-standard" kernel.
+		Only use this if you really know what you are doing.
+		
+config UID16
+	bool "Enable 16-bit UID system calls" if EXPERT
+	depends on HAVE_UID16 && MULTIUSER
+	default y 
+	help 
+		This enables the legacy 16-bit UID syscall wrappers.
+		
+config  MULTIUSER
+	bool "Mutliple users, groups and capabilities support " if EXPERT
+	default y 
+	help 
+		This option enables support for non-root users, groups and 
+		capabilities
+		
+		If you say N here, All processes will rush with UID 0, GID 0, and all 
+		possible capabilites. Saying N here also compiles out support for 
+		system calls related to UIDs, GIDs, and capabilites, such as setuid,
+		setgid, and capset.
+		
+		If unsure, say Y here.
+		
+config SGETMASK_SYSCALL
+	bool "sgetmask/ssetmask syscalls support" if EXPERT
+	def_bool PARISC || MN10300 || BLACKFIN || M68K || PPC || MIPS || X86 || SPARC || CRIS || MICROBLAZE || SUPERH
+	---help---
+		sys_sgetmask and sys_ssetmask are obsolete system calls
+		no longer supported in libc but still enabled by default in some 
+		architectures.
+		
+		If unsure, leave the deafult option here.
+		
+config SYSFS_SYSCALL
+	bool "Sysfs syscall support " if EXPERT
+	default y 
+	---help---
+		sys_sysfs is an obsolete system call no longer supported in libc.
+		Note that disabling this option is mor secure but might break
+		compatibility with some systems.
+		
+		If unsure say Y here .
+		
+config SYSCTL_SYSCALL
+	bool "Sysctl syscall support " if EXPERT
+	depends on PROC_SYSCTL
+	default n 
+	select SYSCTL 
+	---help---
+		sys_sysctl uses binary paths that have been found challenging 
+		to properly maintain and use. The interface in /proc/sys
+		using paths with ascii names is now the primary path to this 
+		information.
+		
+		Almost nothing using the binary sysctl interface so if you are 
+		tring to save some space it is probably safe to disable this,
+		making your kernel marginally smaller.
+		
+		If unsure say N here.
+		
+config POSIX_TIMERS
+	bool "Posix Clocks & timers" if EXPERT
+	default y 
+	help 
+		This includes native support for POSIX timers to the kernel.
+		Some embedded systems have no use for them and therefore they 
+		can be configured out to reduce the size of the kernel image.
+		
+		When this option is disabled, the following syscalls won't be 
+		available: timer_create, timer_gettime: timer_getoverrun,
+		timer_settime, timer_delete, clock_adjtime, getitimer,
+		setitimer, alarm. Furthermore, the clock_settime, clock_gettime,
+		clock_getres and clock_nanosleep syscalls will be limited to 
+		CLOCK_REALTIME, CLOCK_MONOTONIC and CLOCK_BOOTTIME only.
+		
+		If unsure say y.
+		
+config KALLSYMS
+	bool "Load all symbols for debuggin/ksymoops" if EXPERT
+	default y 
+	help 
+		Say Y here to let the kernel print out symbolic crash information and 
+		symbolic stack backtracks. This increases the size of the kernel
+		somewhat, as all symbols have to be loaded into the kernel image.
+		
+config KALLSYMS_ALL
+	bool "Include all symbols in kallsyms"
+	depends on DEBUG_KERNEL && KALLSYMS
+	help 
+		Normally kallsyms only contains the symbols of functions for nicer
+		OOPS messages and backtraces(i.e., symbols from the text and inittext
+		sections). This is sufficient for most cases. And only in very rare 
+		cases(e.g., when a debugger is used) all symbols are required(e.g.,
+		names of variables from the data sections, etc).
+		
+		This option makes sure that all symbols are loaded into the kernel
+		image(i.e.,symbols from all sections) in cost of increased kernel
+		size(depending on the kernel configuration, it may be 300KiB or 
+		something like this).
+		
+		Say N unless you really need all symbols.
+		
+config KALLSYMS_ABSOLUTE_PERCPU
+	bool 
+	depends on KALLSYMS
+	default X86_64 && SMP 
+	
+	
+config KALSYM_BASE_RELATIVE
+	bool 
+	depends on KALLSYMS
+	default !IA64 && !(TILE && 64BIT)
+	help 
+		Instead of emitting them as absolute values in the native word size,
+		emit the symbol references in the kallsyms tales as 32-bit entries,
+		each containing a relative value in the range[base, base+U32_MAx]
+		or, when KALLSYMS_ABSOLUTE_PERCPU is in effect, each containing either
+		an absolute value in the range [0, S32_MAX] or a relative value in the 
+		range[base, base + S32_MAX], where base is the lowest relative symbol 
+		address encountered in the image.
+		
+		On 64-bit builds, this reduces the size of the address table by 50%,
+		but more importantly, it results in entries whose values are build 
+		time constants, and no relocation pass it required at runtime to fix 
+		up the entries based on the runtime load address of the kernel.
+		
+config PRINTK
+	default y 
+	bool "Enable support for printk" if EXPERT
+	select IRQ_WORK
+	help 
+		This option enables normal printk support. Removing it 
+		eliminates most of the message strings from the kernel image
+		 and makes the kernel more or less silent. As this makes it 
+		 very different to diagnose system problems, saying N here is 
+		 strongly discouraged.
+		 
+config PRINTK_NMI
+	def_bool y 
+	depends on PRINTK
+	depends on HAVE_NMI
+	
+config  BUG 
+	bool "BUG() support" if EXPERT
+	default y 
+	help 
+		Disabling this option eliminates support for BUG and WARN, reducing
+		the size of your kernel image and potentially quietly ignoring 
+		numerous fatal conditions. You should only consider disabling this 
+		option for embedded systems with no facilities for reporting errors.
+		Just say Y.
+		
+config ELF_CORE
+	depends on COREDUMP 
+	default y 
+	bool "Enable ELF core dumps" if EXPERT
+	help 
+		Enable support for generating core dumps. Disabling saves about 4K.
+		
+config PCSPKR_PLATFORM
+	bool "Enable PC-Speaker support" if EXPERT
+	depends on HAVE_PCSPKR_PLATFORM
+	select I8253_LOCK
+	default y 
+	help 
+		This option allows to disable the internal PC-Speaker
+		support, saving some memory.
+		
+config BASE_FULL
+	default y 
+	bool "Enable full-sized data structures for core" if EXPERT
+	help 
+		Disabling this option reduces the size of miscellaneous core 
+		kernel data structures. This saves memory on small machines,
+		but may reduce performance.
+		
+config FUTEX
+	bool "Enable futex support" if EXPERT
+	default y 
+	imply RT_MUTEXES
+	help 
+		Disabling this option will cause the kernel to be built without
+		support for "fast userspace mutexes". The resulting kernel may not 
+		run glic-bases applications correctly.
+		
+config FUTEX_PI
+	bool 
+	depends on FUTEX && RT_MUTEXES
+	default y 
+	
+config HAVE_FUTEX_CMPXCHG
+	bool 
+	depends on FUTEX
+	help 
+		Architectures should select this if futex_atomic_cmpxchg_inatomic()
+		is implemented and always working. This removes a couple of runtime 
+		checks.
+		
+config EPOLL
+	bool "Enable eventpoll support" if EXPERT
+	default y 
+	select ANON_INODES
+	help 
+		Disabling this option will cause the kernel to be built without 
+		support for epoll family of system calls.
+		
+		
+		
 
 
 
