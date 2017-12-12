@@ -1314,6 +1314,318 @@ config EPOLL
 		Disabling this option will cause the kernel to be built without 
 		support for epoll family of system calls.
 		
+config SIGNALFD
+	bool "Enable signalfd() system call " if EXPERT
+	select ANON_INODES
+	default y 
+	help 
+		Enable the signalfd() system call that allows to receive signals
+		on a file descriptor.
+		
+		If unsure, say Y.
+		
+config TIMERFD
+	bool "Enable timerfd() system call" if EXPERT
+	select ANON_INODES
+	default y 
+	help 
+		Enable the timerfd() system call that allows to receive timer 
+		events on a file descriptor.
+		
+		If unsure, say Y.
+		
+config EVENTFD
+	bool "Enable eventfd() system call " if EXPERT
+	select ANON_INODES
+	default y 
+	help 
+		Enable the eventfd() system call that allows to receive both 
+		kernel notification(ie.KAIO) or userspace notifications.
+		
+		If unsure, say Y.
+		
+#syscall, maps, verifier
+config BFP_SYSCALL
+	bool "Enable bpf() system call"
+	select ANON_INODES
+	select BPF
+	default n 
+	help 
+		Enable the bpf() system call that allows to manipulate eBPF
+		programs and maps via file descriptors.
+		
+config SHMEM
+	bool "Use full shmem filesystem" if EXPERT
+	default y 
+	depends on MMU 
+	help 
+		The shmem is an internal filesystem used to manage shared memory.
+		It is backed by swap and manages resouce limits. It is also exported
+		to userspace as tmpfs if TMPFS is enabled. Disabling this 
+		option replaces shmem and tmpfs with the much simpler ramfs code,
+		which may be appropriate on small systems without swap.
+		
+config AIO 
+	bool "Enable AIO support" if EXPERT
+	default y 
+	help 
+		This option enables POSIX asynchronous I/O which may by used 
+		by some high performance threaded applications. Disabling
+		this option saves about 7K.
+		
+config ADVISE_SYSCALLS
+	bool "Enable madvise/fadvis syscalls" if EXPERT
+	default y 
+	help 
+		This option enables the madvise and fadvise syscalls, used by 
+		applications to advise the kernel about their furture memory or file 
+		usage, improving performance. If buiding and embedded system where no 
+		applications use these syscalls, you can disable this option to save 
+		space.
+		
+config USERFAULTFD
+	bool "Enable userfaultfd() system call"
+	select ANON_INODES
+	depends on MMU 
+	help 
+		Enable the userfaultfd() system call that allows to intercept and 
+		handle page faults in userland.
+		
+config PCI_QUIRKS
+	default y 
+	bool "Enable PCI quirk workarounds " if EXPERT
+	depends on PCI 
+	help 
+		This enables workarounds for various PCi chipset
+		bugs/quirks. Disable this only if your target machine is
+		unaffected by PCI quirks.
+		
+config MEMBARRIER
+	bool "Enable membarrier() system call" if EXPERT
+	default y 
+	help 
+		Enable the membarrier() system call that allows issuing memory
+		barriers across all running threads, which can be used to distribute
+		the cost of user-space memory barriers asymmetrically by transforming
+		pairs of memory barriers into pairs consisting of membarrier() and a 
+		compiler barrier.
+		
+		If unsure, say Y.
+		
+config EMBEDDED
+	bool "Embedded system"
+	option allnoconfig_y
+	select EXPERT
+	help 
+		This option should be enabled if compiling the kernel for 
+		an embedded system so certain expert options are available
+		for configuration.
+		
+config HAVE_PERF_EVENTS
+	bool 
+	help 
+		See tools/perf/design.txt for details.
+		
+config PC104
+	bool "PC/104 support"
+	help 
+		Expose PC/104 form factor device drivers and options available for 
+		selection and configuration. Enable this option if your target 
+		machine has a PC/104 bus.
+		
+menu "Kernel Performance Events And Counters"
+
+config PERF_EVENTS
+	bool "Kernel performance events and counters"
+	default y if PROFILING
+	depends on HAVE_PERF_EVENTS
+	select ANON_INODES
+	select IRQ_WORK
+	select SRCU
+	help 
+		Enable kernel support for various performance events provided
+		by software and hardware.
+		
+		Software events are supported either built- in or via the 
+		use of generic tracepoints.
+		
+		Most modern CPUs support performance events via performance
+		counter registers. These registers count the number of certain
+		types of hw events: such as instructions executed, cachemisses
+		suffered, or branches mis-predicted- without slowing down the 
+		kernel or applications. These registers can also trigger interrupts
+		when a threshold number of events have passed- and can thus be 
+		used to profile the code that runs on that CPU.
+		
+		The Linux Performance Event subsystem provides an abstraction of 
+		these software and hardward event capabilities, available via a 
+		system call and used by the "perf" utility in tools/perf/. It 
+		provides per tas and per CPU counters, and it provides event 
+		capabilities on top of those.
+		
+		Say Y if unsure.
+		
+config DeBUG_PERF_USE_VMALLOC
+	default n 
+	bool "Debug: use vmalloc to back perf mmap() buffers"
+	depends on PERF_EVENTS && DEBUG_KERNEL && !PPC
+	select PERF_USE_VMALLC
+	help 
+		Use vmalloc memory to back perf mmap() buffers.
+		
+		Mostly useful for debugging the vmalloc code on platforms 
+		that don't require it.
+		
+		Say N if unsure.
+		
+endmenu
+
+config VM_EVENT_COUNTERS
+	default y 
+	bool "Enable VM event counters for /proc/vmstat" if EXPERT
+	help 
+		VM event counters are needed for event counts to be shown.
+		This option allows the disabling of the VM event counters
+		on EXPERT systems. /proc/vmstat will only show page counts
+		if VM event counters are disabled.
+		
+config SLUB_DEBUG
+	default y 
+	bool "Enable SLUB debugging support" if EXPERT
+	depends on SLUB && SYSFS
+	help 
+		SLUB has extensive debug support features. Disabling these can 
+		result in significant savings in code size. This also disables
+		SLUB sysfs support. /sys/slab will not exist and there will be 
+		no support for cache validatoin etc.
+		
+config SLUB_MEMCG_SYSFS_ON
+	default n 
+	bool "Enable memcg SLUB sysfs support by default" if EXPERT
+	depends on SLUB && SYSFS && MEMCG
+	help 
+		SLUB creates a directory under /sys/kernel/slab for each 
+		allocation cache to host info and debug files.If memory 
+		cgroup is enabled, each cache can have per memory cgroup 
+		caches. SLUB can create the same sysfs directories for these 
+		caches under /sys/kernel/slab/CHCHE/cgroup but it can lead 
+		to a very high number of debug files being created. This is 
+		controlled by slub_memcg_sysfs boot parameter and this 
+		config option determines the  parameter's default value.
+		
+config COMPAT_BRK
+	bool "Disable heap randomization"
+	default y 
+	help 
+		Randomizing heap placement makes heap exploits harder, but it 
+		also breaks ancient binaryies(incluing anything libc5 based).
+		This option changes the bootup default to heap randomization
+		disabled, and can be overridden at runtime by setting 
+		/proc/sys/kernel/randomize_va_space to 2.
+		
+		On non-ancient distros(post-2000 ones) N is usually a safe choice.
+		
+choice
+	prompt "Choose SLAB allocator"
+	default SLUB
+	help 
+		This option allows to select a slab allocator.
+		
+config SLAB
+	bool "SLAB"
+	select HAVE_HARDENDD_USERCOPY_ALLOCATOR
+	help 
+		The regular slab allocator that is established and know to work 
+		well in all environments. It organizes cache hot objects in 
+		per cpu and per node queues.
+		
+config SLUB 
+	bool "SLUB(Unqueued Allocator)"
+	select HAVE_HARDENED_USERCOPY_ALLOCATOR
+	help 
+		SLUB is a slab allocator that minimizes cache line usage 
+		instead of managing queues of cached objects(SLAB approach).
+		Per cpu caching is realized using slabs of objects instead
+		of queues of objects. SLUB can use memory efficiently
+		and has enhanced diagnostics. SLUB is the default choice for 
+		a slab allocator.
+		
+config SLOB 
+	depends on EXPERT
+	bool "SLOB(Simple Allocator)"
+	help 
+		SLOB replaces the stock allocator with a drastically simpler
+		allocator. SLOB is generally more space efficient but 
+		does not perform as well on large systems.
+		
+endchoice
+
+
+config SLAB_MERGE_DEFAULT
+	bool "Allow slab caches to be merged"
+	default y 
+	help 
+		For reduced kernel memory fragmentation, slab caches can be 
+		merged when they share the same size and other characteristics.
+		This carries a risk of kernel heap overflows being able to 
+		overwrte objects from merged caches(and more easily control 
+		cache layout),which makes such heap attacks easier to exploits
+		by attackers. By keeping caches unmerged,these kinds of exploits
+		can usually only damage objects in the same cache. To disable 
+		merging at runtime, "slab_nomerge" can be passed on the kernel 
+		command line.
+		
+config SLAB_FREELIST_RANDOM
+	default n 
+	depends on SLAB || SLUB
+	bool "SLAB freelist randomization"
+	help 
+		Randomizes the freelist order used on creating new pages. This 
+		security feature reduces the predictability of the kernel slab 
+		allocator against heap overflows.
+		
+config SLAB_FREELIST_HARDENED
+	bool "Harden slab freelist metadata"
+	depends on SLUB
+	help 
+		Many kernel heap attacks try to target slab cache metadata and 
+		other infrastructure. This options makes minor performance 
+		sacrifies to harden the kernel slab allocator against common 
+		freelist exploit methods.
+		
+config SLUB_CPU_PARTIAL
+	default y 
+	depends on SLUB && SMP 
+	bool "SLUB per cpu partial cache"
+	help 
+		Per cpu partial caches accellerate objects allocation and freeing 
+		that is local to a processor at the price of more indeterminism
+		in the latency of the free. On overflow these caches will be cleared
+		which requires the talking of locks that may cause latency spikes.
+		Typically one would choose no for a realtime system.
+		
+config MMAP_ALLOW_UNINITIALIZED
+	bool "Allow mmaped anonymous memory to be uninitialized"
+	depends on EXPERT && !MMU
+	default n 
+	help 
+		Normally, and according to the Linux spec, anonymous memory obtained
+		from mmap() has it's contents cleared before it is passed to 
+		userspace. Enabling this config option allows you to request that 
+		mmap() skip that if it is given an MAP_UNINITIALIZED flag, thus 
+		providing a huge performance boost. If this option is not enabled,
+		then the flag will be ignored.
+		
+		This is taken advantage of uClibc's malloc(), and also by 
+		ELF-FDPIC binfmt's brk and stack allocator.
+		
+		Because of the obvious security issues, this option should only be 
+		enabled on embedded devides where you control what is run in 
+		userspace. Since that isn't generally a problem on no-MMU systems,
+		it is normally safe to say Y here.
+		 
+		See Documentation/nommu-mmap.txt for more information.
+		
 		
 		
 
