@@ -1628,7 +1628,305 @@ config MMAP_ALLOW_UNINITIALIZED
 		
 		
 		
+config SYSTEM_DATA_VERIFICATION
+	def_bool n 
+	select SYSTEM_TRUSTED_KEYRING
+	select KEYS
+	select CRYPTO
+	select CRYPTO_SRA
+	select ASYMMETRIC_KEY_TYPE
+	select ASYMMETRIC_PUBLIC_KEY_SUBTYPE
+	select ASN1
+	select OID_REGISTRY
+	select X509_CERTIFICATE_PARSER
+	select PKCS7_MESSAGE_PARSER
+	help 
+		Provide PKCS#7 message verification using the contents of the system
+		trusted kering to provide public keys. This then can be used for 
+		module verification, kexec image verification and firmware bolb 
+		verification.
+		
+config PROFILING
+	bool "Profiling support"
+	help 
+		Say Y here to enable the extended profiling support mechanisms used 
+		by profilers such as OProfile.
+		
+##
+## Place an empty function call at each tracepoint site. Can be
+## dynamically changed for a probe function.
 
+config TRACEPOINTS
+	bool 
+	
+source "arch/Kconfig"
+
+endmenu ## General setup 
+
+config HAVE_GENERIC_DMA_COHERENT
+	bool 
+	default n 
+	
+config SLABINFO
+	bool
+	depends on PROC_FS
+	depends on SLAB || SLUB_DEBUG
+	default y 
+	
+config RT_MUTEXES
+	bool 
+	
+config BASE_SMALL
+	int 
+	default 0 if BASE_FULL
+	default 1 !BASE_FULL
+	
+menuconfig MODULES
+	bool "Enable loadable module support"
+	option modules
+	help 
+		Kernel modules are small piece of compiled code which can 
+		be inserted in the running kernel, rather than being 
+		permanently built into the kernel. You use the "modprobe"
+		tool to add(and sometimes remove)them. If you say Y here,
+		many parts of the kernel can be built as modules (by 
+		answerin M instead of Y where indicated): this is most 
+		userful for infrequently used options which are not required
+		for booting. For more information, see the man pages for 
+		modprobe, Ismode, modinfo, insmode, and rmmode.
+		
+		If you ay Y here, you will need to run "make 
+		modules_install" to put the modules under /lib/modules/
+		where modprobe can find them(you may need to be root to do 
+		this).
+		
+		If unsure, say Y.
+		
+if MODULES
+
+config MODULE_FORCE_LOAD
+	bool "Forced module loading"
+	default n 
+	help 
+		Allow loading of modules without version information(ie.modprobe
+		--force). Forced module loading sets the 'F'(forced) taint flag and 
+		is usually a really bad idea.
+		
+config MODULE_UNLOAD
+	bool "Module unloading"
+	help 
+		Without this option you will not be able to unload any 
+		modules(note that some modules may not be unloadable
+		anyway), which makes your kernel smaller, faster 
+		and simpler. if unsure, say Y.
+		
+config MODULE_FORCE_UNLOAD
+	bool "Forced module unloading"
+	depends on MODULE_UNLOAD
+	help 
+		this option allows you to force a module to unload, even if the 
+		kernel believes it is unsafe: the kernel will remove the module 
+		without waiting for anyone to stop using it (using the -f option to 
+		rmmode). this is mainly for kernel developers and desperate users.
+		If unsure, say N.
+		
+config MODVERSIONS
+	bool "Module versioning support"
+	help 
+		Usually, you have to use modules compiled with your kernel.
+		Saying Y here makes it sometimes possible to use modules
+		compiled for different kernels, by adding enough information 
+		to the modules to (hopefully) spot any changes which would 
+		make them incompatible with the kernel you are running. If 
+		unsure, say N.
+		
+config MODULE_REL_CRCS
+	bool 
+	depends on MODVERSIONS
+	
+	
+config MODULE_SRCVERSION_ALL
+	bool "Source checksum for all modules"
+	help 
+		Modules which contain a MODULE_VERSION get an extra "srcversion"
+		field inserted into their modinfo section, which contains  a 
+		sum of the source files which made it. This helps maintainers
+		see exactly which souce was used to build a module(since 
+		others sometimes change the module souce without updating 
+		the version). With this option, such a "srcversion" field 
+		will be created for all modules. If unsure, say N.
+		
+config MODULE_SIG 
+	bool "Module signature verification"
+	depends on MODULES
+	select SYSTEM_DATA_VERIFICATION
+	help 
+		Check modules for valid signatures upon load: the signature
+		is simply appended to the module. For more information see 
+		Documentation/module-signing.txt
+		
+		Note that this option adds the OpenSSL development packages as a 
+		kernel build dependcy so that the signing tool can use its crypto 
+		library.
+		
+		!!!WARNING!!! If you enable this option, you MUST make sure that the 
+		module DOES NOT get stripped after being signed. This includes the 
+		debuginfo strip done by some packagers(such as rpmbuild) and 
+		inclusion into an initramfs that wants the module size reduced.
+		
+config MODULE_SIG_FORCE
+	bool "Require modules to be validly signed"
+	depends on MODULE_SIG
+	help 
+		Reject unsigned modules or signed modules for which we don't have a 
+		key. Without this, such modules will simply taint the kernel.
+		
+config MODULE_SIG_ALL
+	bool "Automatically sign all modules"
+	default y 
+	depends on MODULE_SIG
+	help 
+		Sign all modules during make modules_install. Without this option,
+		modules must be signed manually, using the scripts/sign-file tool .
+		
+comment "Do not forget to sign required modules with scripts/sign-file"
+	depends on MODULE_SIG_FORCE && !MODULE_SIG_ALL
+	
+choice
+	prompt "Which hash algorithm should modules be signed with?"
+	depends on MODULE_SIG
+	help 
+		This determines which sort of hashing algorithm will be used during
+		signature generation. This algorithm_must_ be built into the kernel 
+		directly so that signature verification can take place. It is not 
+		possible to load a signed module containing the algorithm to check 
+		the signature on that module.
+		
+config MODULE_SIG_SHA1
+	bool "Sign modules with SHA-1"
+	select CRYPTO_SHA1
+	
+config MODULE_SIG_SHA224	
+	bool "Sign modules with SHA-224"
+	select CRYPTO_SHA256
+	
+config MODULE_SIG_SHA256	
+	bool "Sign modules with SHA-256"
+	select CRYPTO_SHA256
+	
+config MODULE_SIG_384
+	bool "Sign modules with SHA-384"
+	select CRYPTO_SHA512
+	
+	
+config MODULE_SIG_SHA512
+	bool "Sign modules with SHA-512"
+	select CRYPTO_SHA512
+	
+endchoice
+
+config MODULE_SIG_HASH
+	string 
+	depends on MODULE_SIG
+	default "sha1" if MODULE_SIG_SHA1
+	default "sha224" if MODULE_SIG_SHA224
+	default "sha256" if MODULE_SIG_SHA256
+	default "sha384" if MODULE_SIG_SHA384
+	default "sha512" if MODULE_SIG_SHA512
+	
+config MODULE_COMPRESS
+	bool "Compress modules on installation"
+	depends on MODULES
+	help 
+	
+		Compresses kernel modules when 'make modules_install' is run; gzip or 
+		xz depending on "Compression algorithm" below.
+		
+		module-init-tools MAY support gzip, and kmod MAY support gzip and xz.
+		
+		Out-of-tree kernel modules installed using Kbuild will also be 
+		compressed upon installation.
+		
+		Note: for modules inside an initrd or initramfs, it's more efficient 
+		to compress the whole initrd or initramfs instead.
+		
+		Note: This is fully compatible with signed modules.
+		
+		If in doubt , say N.
+		
+		
+choice
+	prompt "Compression algorithm"
+	depends on MODULE_COMPRESS
+	default MODULE_COMPRESS_GZIP
+	help 
+		This determines which sort of compression will be used during 
+		'make modules_install'.
+		
+		GZIP(default) and XZ are supported .
+		
+config MODULE_COMPRESS_GZIP 
+	bool "GZIP"
+	
+config MODULE_COMPRESS_XZ
+	bool "XZ"
+	
+endchoice
+
+config TRIM_UNUSED_KSYMS
+	bool "Trim unused exported kernel symbols"
+	depends on MODULES && ! UNUSED_SYMBOLS
+	help 
+		The kernel and some modules make many symbols available for 
+		other modules to use via EXPORT_SYMBOLS() and variants. Depending 
+		on the se tof modules being selected in your kernel configuratoin,
+		many of those exported symbols might never be used.
+		
+		This option allows for unused exported symbols to be dropped from 
+		the build. In turn, this provides the compiler more opportunities 
+		(especially when using LTO) for optimizing the code and reducing 
+		binary size.  This might  have some security advantages as well.
+		
+		If unsure, or if you need to build out-of-tree modules, say N.
+		
+endif # MODULES
+
+config MODULE_TREE_LOOKUP
+	def_bool y 
+	depends on PERF_EVENTS || TRACING
+	
+config INIT_ALL_POSSIBLE
+	bool 
+	help 
+		Back when each arch used to define their own cpu_online_mask and 
+		cpu_possible_mask, some of them chose to initialize cpu_possible_mask
+		with all 1s, and others with all 0s. When they were centralised,
+		it was better to provide this option than to break all the archs
+		and have serveral arch maintainers pursuing me down dark alleys.
+		
+source "block/Kconfig"
+
+config PEREMPT_NOTIFIERS
+	bool 
+	
+config PADATA
+	depends on SMP 
+	bool 
+	
+config ASN1
+	tristate
+	help 
+		Build a simplle ASN.1 grammar compiler that produces a bytecode output 
+		that can be interpreted by the ASN.1 stream decoder and used to 
+		inform it as to what tags are to expected in a stream  and what 
+		functions to call on what tags.
+		
+source "kernel/Kconfig.locks"
+
+		
+	
+		
+	
 
 
 
