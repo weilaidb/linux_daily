@@ -906,6 +906,210 @@ static void __init do_initcalls(void)
 		do_initcall_level(level);
 }
 
+/**
+** Ok, the machine is now initialized. None of the devices
+** have been touched yet, but the CPU subsytem is up and 
+** running, and memory and process management works.
+**
+** NOw we can finally start doing some real work.
+**/
+static void __init do_basic_setup(void)
+{
+	cpuset_init();
+	shmem_init();
+	driver_init();
+	init_irq_proc();
+	do_ctors();
+	usermodehelper_enable();
+	do_initcalls();
+}
+
+static void __init do_pre_smp_initcalls(void)
+{
+	initcall_t *fn;
+	
+	for(fn = __initcall_start; fn < __initcall0_start; fn__)
+	{
+		do_one_initcall(*fn);
+	}
+}
+
+/** 
+** This function request modules which should be loaded by default and is 
+** called twice right after initrd is mounted and right before init is 
+** exec'd. If such moudles are on either initrd or rootfs, they will be 
+** loaded before control is passed to userland.
+**/
+void __init load_default_moudles(void)
+{
+	load_default_elevator_module();
+}
+
+static int run_init_process(const char *init_filename)
+{
+	argv_init[0] = init_filename;
+	
+	return do_execve(getname_kernel(init_filename),
+			(const char __user *const __user *) argv_init,
+			(const char __user *const __user *) envp_init);
+}
+
+static int try_to_run_init_process(const char *init_filename)
+{
+	int ret;
+	
+	ret = run_init_process(init_filename);
+	
+	if(ret && ret != -ENOENT) {
+		pr_err("Starting init: %s exist but could't execute it(error %d)\n",
+			init_filename, ret);
+	}
+	
+	return ret;
+}
+
+static noinline void __init kernel_init_freeable(void);
+
+#if defined(CONFIG_STRICT_KERNEL_RWX) || defined(CONFIG_STRICT_MOUDLE_RWX)
+bool rodata_enabled __ro_after_init = true;
+static int __init set_debug_rodata(char *str)
+{
+	return strtobool(str, &rodata_enabled);
+}
+
+__setup("rodata=", set_debug_rodata);
+#endif
+
+#ifdef CONFIG_STRICT_KERNEL_RWX
+static void mark_readonly(void)
+{
+	if(rodata_enabled) {
+		mark_rodata_ro();
+		rodata_test();
+	} else
+		pr_info("Kernel memory protection disabled.\n");
+}
+
+#else
+static inline void mark_readonly(void)
+{
+	pr_warn("This architecture does not have kernel memory protection.\n");
+}
+
+#endif
+
+static int __ref kernel_init(void *unused)
+{
+	int ret;
+	
+	kernel_init_freeable();
+	/** need to finish all async__init code before freeing the memory **/
+	async_synchronize_full();
+	ftrace_free_init_mem();
+	free_initmem();
+	mark_readonly();
+	system_state = SYSTEM_RUNNING;
+	numa_default_policy();
+	
+	rcu_end_inkernel_boot();
+	
+	if(ramdisk_execute_command) {
+		ret = run_init_process(ramdisk_execute_command);
+		if(!ret)
+			return 0;
+		pr_err("Failed to execute %s(error %d)\n",
+			ramdisk_execute_command, ret);
+			
+	}
+	
+	/*
+	** We try each of these until one succeeds.
+	**
+	** The Bourne shell can be used instead of init if we are 
+	** trying to recover a really broken machine.
+	**/
+	if(execute_command) {
+		ret = run_init_process(execute_command);
+		if(!ret)
+			return 0;
+		panic("Requested init %s failed(error %d)\n",
+			execute_command, ret);
+	}
+	
+	if(!try_to_run_init_process("/sbin/init") ||
+		!try_to_run_init_process("/etc/init") ||
+		!try_to_run_init_process("/bin/init") ||
+		!try_to_run_init_process("/bin/sh"))
+		return 0;
+	panic("No working init found. Try passing init=option to kernel."
+		"See Linux Documentation/admin-guide/init/rst for guidance.");
+}
+
+static noinline void __init kernel_init_freeable(void)
+{
+	/**
+	** Wait until kthreadd is all set-up.
+	**/
+	wait_for_completion(&kthreadd_done);
+	
+	/** Now the scheduler is fully set up and can do blocking allocations **/
+	gfp_allowed_mask = __GFP_BITS_MASK;
+	
+	/**
+	** init can allocate pages on any node 
+	**/
+	set_mems_allowed(node_states[N_MEMORY]);
+	
+	cad_pid = task_pid(current);
+	
+	smp_prepare_cpus(setup_max_cpus);
+	
+	workqueue_init();
+	
+	init_mm_internals();
+	
+	do_pre_smp_initcalls();
+	lockup_detector_init();
+	
+	smp_init();
+	sched_init_smp();
+	
+	page_alloc_init_late();
+	
+	do_basic_setup();
+	
+	/** Open the /dev/console on the rootfs, this should never fail **/
+	if(sys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)
+		pr_err("Warning: unable to  open an initial console.\n");
+	
+	(void) sys_dup(0);
+	(void) sys_dup(0);
+	
+	/**
+	** check if there is an early userspace init. If yes, let it do all 
+	** the work 
+	**/
+	if(!ramdisk_execute_command)
+		ramdisk_execute_command = "/init";
+	
+	if(sys_access((const char __user *)ramdisk_execute_command, 0) != 0) {
+		ramdisk_execute_command = NULL;
+		prepare_namespace();
+	}
+	
+	/*
+	** Ok, we have completed the initial bootup, and 
+	** we're essentially up and running. Get rid of the 
+	** initmme segments and start the user-mode stuff.
+	**
+	** rootfs is available now, try loading the public keys 
+	** and default modules
+	**/
+	integrity_load_keys();
+	load_default_modules();
+}
+
+
 
 
 
