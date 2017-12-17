@@ -560,6 +560,42 @@ COMPAT_SYSCALL_DEFINE3(shmat, int, shmid, compat_uptr_t, shmaddr, int, shmflg)
 	return (long)ret;
 }
 
+static inline int get_compat_shmid64_ds(struct shmid64_ds *sem64,
+					struct compat_shmid64_ds __user *up64)
+{
+	if(!access_ok(VERIFY_READ, up64, sizeof(*up64)))
+		return -EFAULT;
+	return __get_compat_ipc64_perm(&sem64->shm_perm, &up64->shm_perm);
+}
+
+static inline int get_compat_shmid_ds(struct shmid64_ds *s,
+						struct compat_shmid_ds __user *up)
+{
+	if(!access_ok(VERIFY_READ, up, sizeof(*up)))
+		return -EFAULT;
+	return __get_compat_ipc_perm(&s->shm_perm, &up->shm_perm);
+}
+
+
+
+static inline int put_compat_shmid64_ds(struct shmid64_ds *sem64,
+						struct compat_shmid64_ds __user *up64)
+{
+	int err;
+	
+	if(!access_ok(VERIFY_READ, up64, sizeof(*up64)))
+		return -EFAULT;
+	err = __put_compat_ipc64_perm(&sem64->shm_perm, &up64->shm_perm);
+	err |= __put_user(sem64->shm_atime, &up64->shm_atime);
+	err |= __put_user(sem64->shm_dtime, &up64->shm_dtime);
+	err |= __put_user(sem64->shm_ctime, &up64->shm_ctime);
+	err |= __put_user(sem64->shm_segsz, &up64->shm_segsz);
+	err |= __put_user(sem64->shm_nattch, &up64->shm_nattch);
+	err |= __put_user(sem64->shm_cpid, &up64->shm_cpid);
+	err |= __put_user(sem64->shm_lpid, &up64->shm_lpid);
+	
+	return err;
+}
 
 
 
