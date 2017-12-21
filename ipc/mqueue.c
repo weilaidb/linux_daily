@@ -317,7 +317,226 @@ static int mqueue_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 }
 
- 
+ static struct dentry *mqueue_mount(struct file_system_type *fs_type,
+				int flags, const char *dev_name,
+				void *data)
+{
+	struct ipc_namespace *ns;
+	if(flags & MS_KERNMOUNT) {
+		ns = data;
+		data = NULL;
+	} else {
+		ns = current->nsproxy->ipc_ns;
+	}
+	
+	return mount_ns(fs_type, flags, data, ns, ns->user_ns, mqueue_fill_super);
+}
+
+static void init_once(void *foo)
+{
+	struct  mqueue_inode_info *p = (struct mqueue_inode_info *)foo;
+	
+	inode_init_once(&p->vfs_inode);
+}
+
+static struct inode *mqueue_alloc_inode(struct super_block *sb)
+{
+	struct mqueue_inode_info *ei;
+	
+	e = kmem_cache_alloc(mqueue_inode_cachep, GFP_KERNEL);
+	if(!ei)
+		return NULL;
+	
+	return &ei->vfs_inode;
+}
+
+static void mqueue_i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kmem_cache_free(mqueue_inode_cachep, MQUEUE_I(inode));
+}
+
+static void mqueue_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, mqueue_i_callback);
+}
+
+static void mqueue_evict_inode(struct inode *inode)
+{
+	struct mqueue_inode_info *info;
+	struct user_struct *user;
+	unsigned long mq_bytes, mq_treesize;
+	struct ipc_namespace *ipc_ns;
+	struct msg_msg *msg;
+	
+	clear_inode(inode);
+	
+	if(S_ISDIR(inode->i_mode))
+		return;
+	
+	ipc_ns = get_ns_from_inode(inode);
+	info = MQUEUE_I(inode);
+	spin_lock(&info->lock);
+	while((msg = msg_get(info)) != NULL)
+		free_msg(msg);
+	kfree(info->node_cache);
+	spin_unlock(&info->lock);
+	
+	/** Total amount of bytes accounted for the mqueue **/
+	mq_treesize = info->attr.mq_maxmsg * sizeof(struct msg_msg) + 
+		min_t(unsigned int, info->attr.mq_maxmsg, MQ_PRIO_MAX) *
+		sizeof(struct posix_msg_tree_node);
+		
+	mq_bytes = mq_treesize + (info->attr.mq_maxmsg *
+					info->attr.mq_msgsize);
+	user = info->user;
+	
+	if(user) {
+		spin_lock(&mq_lock);
+		user->mq_bytes -= mq_bytes;
+		/** 
+		** get_ns_from_inode() ensures that the 
+		** (ipc_ns == sb->s_fs_info) is either a valid ipc_ns
+		** to which we now hold a reference, or it is NULL.
+		** We can't put it here under mq_lock, though.
+		**/
+		if(ipc_ns)
+			ipc_ns->mq_queues_count--;
+		spin_unlock(&mq_lock);
+		free_uid(user);
+		
+	}
+	
+	if(ipc_ns)
+		put_ipc_ns(ipc_ns);
+}
+
+static int mqueue_create(struct inode *dir, struct dentry *dentry,
+					umode_t mode, bool excl)
+{
+	struct inode *inode;
+	struct mq_attr *attr = dentry->d_fsdata;
+	int error;
+	struct ipc_namespace *ipc_ns;
+	
+	spin_lock(&mq_lock);
+	ipc_ns = __get_ns_from_inode(dir);
+	if(!ipc_ns) {
+		error = -EACCESS;
+		goto out_unlock;
+	}
+	
+	if(ipc_ns->mq_queues_cout >= ipc_ns->mq_queues_max &&
+		!capable(CAP_SYS_RESOURCE)) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	
+	ipc_ns->mq_queues_count++;
+	spin_unlock(&mq_lock);
+	
+	inode = mqueue_get_inode(dir->i_sb, ipc_ns, mode, attr);
+	if(IS_ERR(inode)) {
+		
+		error = PTR_ERR(inode);
+		spin_lock(&mq_lock);
+		ipc_ns->mq_queues_count--;
+		goto out_unlock;
+	}
+	
+	put_ipc_ns(ipc_ns);
+	dir->i_size += DIRENT_SIZE;
+	dir->i_ctime = dir->i_mtime = dir->i_atime = current_time(dir);
+	
+	d_instantiate(dentry, inode);
+	dget(dentry);
+	
+out_unlock:
+	spin_unlock(&mq_lock);
+	if(ipc_ns)
+		put_ipc_ns(ipc_ns);
+	
+	return error;
+}
+
+static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry);
+	
+	dir->i_ctime = dir->i_mtime = dir->i_atime = current_time(dir);
+	dir->i_size -= DIRENT_SIZE;
+	drop_nlink(inode);
+	dput(dentry);
+	return 0;
+}
+
+/**
+** This is routine for system read from queue file.
+** To avoid mess with doing here some sort of mq_receive we allow 
+** to read only queue size & notification (the only values 
+** that are interesting from user point of view and aren't accessible 
+** through std routines )
+**/
+static ssize_t mqueue_read_file(struct file *filp, char __user *u_data,
+				size_t count, loff_t *off)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+	char buffer[FILENT_SIZE];
+	ssize_t ret;
+	
+	spin_lock(&info->lock);
+	snprintf(buffer, sizeof(buffer),
+		"QSIZE:%-10u NOTIFY:%-5d SIGNO:%-5d NOTIFY_PID:%-6d\n",
+		info->qsize,
+		info->notify_owner ? info->notify.sigev_notify: 0,
+		(info->notify.sigev_notify == SIGEV_SIGNAL) ?
+			info->notify.sigev_signo : 0,
+			pid_vnr(info->notify_owner));
+	spin_unlock(&info->lock);
+	buffer[sizeof(buffer) - 1] = '\0';
+	
+	ret = simple_read_from_buffer(u_data, count, off, buffer,
+				strlen(buffer));
+	if(ret <= 0)
+		return ret;
+	
+	file_inode(filp)->i_atime = file_inode(filp)->i_ctime = current_time(file_inode(filp));
+	
+	return ret;
+}
+
+struct mqueue_flush_file(struct file *filp, fl_owner_t id)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+	
+	spin_lock(&info->lock);
+	if(task_tgid(current) == info->notify_owner)
+		remove_notification(info);
+	
+	spin_unlock(&info->lock);
+	
+	return 0;
+}
+
+static unsigned int mqueue_poll_file(struct file *filp, struct poll_table_struct *poll_tab)
+{
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
+	int retval = 0;
+	
+	poll_wait(filp, &info->wait_q, poll_tab);
+	
+	spin_lock(&info->lock);
+	if(info->attr.mq_curmsg)
+		retval |= POLLIN | POLLRDNORM;
+	if(info->attr.mq_curmsgs < info->attr.mq_maxmsg)
+		retval |= POLLOUT | POLLWRNORM;
+	
+	spin_unlock(&info->lock);
+	
+	return retval;
+}
+
+
  
  
  
