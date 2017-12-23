@@ -537,6 +537,162 @@ static unsigned int mqueue_poll_file(struct file *filp, struct poll_table_struct
 }
 
 
+/** Adds current to info->e_wait_q[sr] before element with smaller prio **/
+static void wq_add(struct mqueue_inode_info *info, int sr,
+				struct ext_wait_queue *ewp)
+{
+	struct ext_wait_queue *walk;
+	
+	ewp->task  = current;
+	
+	list_for_each_entry(walk, &info->e_wait_q[sr].list, list) {
+		if(walk->task->static_prio <= current->static_prio) {
+			list_add_tail(&ewp->list, &walk->list);
+			return;
+		}
+	}
+	list_add_tail(&ewp->list, &info->e_wait_q[sr].list);
+}
+
+/**
+** Puts current task to sleep. Caller must hold queue lock. After return
+** lock isn't held.
+** sr: SEND or RECV
+**/
+static int wq_sleep(struct mqueue_inode_info *info, int sr, 
+				ktime_t *timeout, struct ext_wait_queue *ewp)
+		__release(&info->lock)
+{
+	int retval;
+	signed long time;
+	
+	wq_add(info, sr, ewp);
+	for(;;) {
+		__set_current_state(TASK_INTERRUPTIBLE);
+		
+		spin_unlock(&info->lock);
+		time = schedule_hrtimeout_range_clock(timeout, 0,
+				HRTIMER_MODE_ABS, CLOCK_REALTIME);
+		if(ewp->state == STATE_READY) {
+			
+			retval = 0;
+			goto out;
+		}
+		spin_lock(&info->lock);
+		if(ewp->state == STATE_READY) {
+			retval = 0;
+			goto out_unlock;
+		}
+		if(signal_pending(current)) {
+			retval = -ERESTARTSYS;
+			break;
+		}
+		if(time == 0) {
+			retval = -ETIMEOUT;
+			break;
+		}
+	}
+	list_del(&ewp->list);
+out_unlock:
+	spin_unlock(&info->lock);
+out:
+	return retval;
+}
+
+/** 
+** Returns waiting task that should be serviced first or NULL if none exists **
+**/
+static struct ext_wait_queue *wq_get_first_waiter(
+			struct mqueue_inode_info *info, int sr)
+{
+	struct list_head *ptr;
+	
+	ptr = info->e_wait_q[sr].list.prev;
+	if(ptr == &info->e_wait_q[sr].list)
+		return NULL;
+	
+	return list_entry(ptr, struct ext_wait_queue, list);
+}
+
+static inline void set_cookie(struct sk_buff *skb, char code)
+{
+	((char *)skb->data)[NOTIFY_COOKIE_LEN - 1] = code;
+}
+/**
+** The next functoin is only to split too long sys_mq_timesend
+**/
+static void __do_notify(struct mqueue_inode_info *info)
+{
+	/** notification
+	** invoked when there is registed process and there isn't process
+	** waiting synchronously for message AND state of queue changed from 
+	** empty to not empty. Here we are sure that no one is waiting
+	** synchronously .**/
+	if(info->notify_owner && 
+		info->attr.mq_curmsgs == 1) {
+		struct siginfo sig_i;
+		switch(info->notify.sigev_notify) {
+		case SIGEV_NODE:
+			break;
+		case SIGEV_SIGNAL:
+			/** sends signal **/
+			sig_i.signo = info->notify_sigev_signo;
+			sig_i.si_error = 0;
+			sig_i.si_code = SI_MESGQ;
+			sig_i.si_value = info->notify_sigev_value;
+			/** map current pid/uid into info->owner's namespaces **/
+			rcu_read_lock();
+			sig_i.si_pid = task_tgid_nr_ns(current,
+						ns_of_pid(info->notify_owner));
+			sig_i.si_uid = from_kuid_munged(info->notify_user_ns, current_uid());
+			rcu_read_lock();
+			kill_pid_info(info->notify.sigev_signo,
+							&sig_i, info->notify_owner);
+			break;
+		case SIGEV_THREAD:
+			set_cookie(info->notify_cookie, NOTIFY_WORKENUP);
+			netlink_sendskb(info->notify_sock, info->notify_cookie);
+			break;
+		}
+		
+		/** after notification unregisters process **/
+		put_pid(info->notify_owner);
+		put_user_ns(info->notify_user_ns);
+		info->notify_owner = NULL;
+		info->notify_user_ns = NULL;
+			
+			
+	}
+	wake_up(&info->wait_q);
+	
+}
+
+
+static int prepare_timeout(const struct timespec __user *u_abs_timeout,
+				struct timespec *ts)
+{
+	if(copy_from_user(ts, u_abs_timeout, sizeof(struct timespec)))
+		return -EFAULT;
+	if(!timespec_valid(ts))
+		return -EINVAL;
+	return 0;
+}
+
+static void remove_notification(struct mqueue_inode_info *info)
+{
+	if(info->notify_owner != NULL &&
+		info->notify.sigev_notify == SIGEV_THREAD) {
+		set_cookie(info->notify_cookie, NOTIFY_REMOVED);
+		netlink_sendskb(info->notify_sock, info->notify_cookie);
+	}
+	
+	put_pid(info->notify_owner);
+	put_user_ns(info->notify_user_ns);
+	info->notify_owner = NULL;
+	info->notify_user_ns  = NULL;
+}
+ 
+ 
  
  
  
