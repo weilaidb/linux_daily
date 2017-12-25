@@ -860,6 +860,126 @@ out_putname:
 	return fd;
 }
 
+SYSCALL_DEFINE4(mq_open, const char __user *, u_name, int, oflag, umode_t, mode,
+				struct mq_attr __user *, u_attr)
+{
+	struct mq_attr attr;
+	if(u_attr && copy_from_user(&attr, u_attr, sizeof(struct mq_attr)))
+		return -EFAULT;
+	return do_mq_open(u_name, oflag, mode, u_attr ? &attr : NULL);
+}
+
+SYSCALL_DEFINE1(mq_unlink, const char __user *, u_name)
+{
+	int err;
+	struct filename *name;
+	struct dentry *dentry;
+	struct inode *inode = NULL;
+	struct ipc_namespace *ipc_ns  = current->nsproxy->ipc_ns;
+	struct vfsmount *mnt = ipc_ns->mq_mnt;
+	
+	name = getname(u_name);
+	if(IS_ERR(name))
+		return PTR_ERR(name);
+	
+	audit_inode_parent_hidden(name, mnt->mnt_root);
+	err = mnt_want_write(mnt);
+	if(err)
+		goto out_name;
+	inode_lock_nested(d_inode(mnt->mnt_root), I_MUTEX_PARENT);
+	dentry = lookup_one_len(name->name, mnt->mnt_root,
+					strlen(name->name));
+	if(IS_ERR(dentry)){
+		err = PTR_ERR(dentry);
+		goto out_unlock;
+	}
+	
+	inode = d_inode(dentry);
+	if(!inode) {
+		err = -ENOENT;
+	} else {
+		ihold(inode);
+		err = vfs_unlink(d_inode(dentry->d_parent), dentry, NULL);
+	}
+	dput(dentry);
+	
+out_unlock:
+	inode_unlock(d_inode(mnt->mnt_root));
+	if(inode)
+		iput(inode);
+	mnt_drop_write(mnt);
+	
+out_name:
+	putname(name);
+	
+	return err;
+	
+}
+
+/**
+** Pipelined send and receive functions.
+** 
+** If a receiver finds  no waiting message, then it registers itself in the 
+** list of waiting receivers. A sender checks that list before adding the new 
+** message into the message array. If there is a waitin receiver, the nit 
+** by passes the message array and directly hands the message over to the 
+** reciever. The receiver accpets the message and returns without grabbing the 
+** queue spinlock:
+**
+** - Set pointer to message.
+** - Queue the receiver task for later wakeup(without the info->lock).
+** - Update its state to STATE_READY. Now the reciever can continue.
+** - Wake up the process after the lock is dropped. Should the process wake up 
+**     before this wakup(due to  a timeout or a signal) it will either see 
+**     STATE_READY and continue or acquire the lock to check the state again.
+**
+** The same algorithm is used for senders.
+**/
+
+/**
+** pipelined_send() - send a message directly to the task waiting in 
+** sys_mq_timedreceiver() (without inserting message into a queue ).
+**/
+static inline void pipelined_send(struct wake_q_head *wake_q,
+				struct mqueue_inode_info *info,
+				struct msg_msg *message,
+				struct ext_wait_queue *receiver)
+{
+	receiver->msg = message;
+	list_del(&receiver->list);
+	wake_q_add(wake_q, receiver->task);
+	/**
+	** Rely on the implicit cmpxchg barrier from wake_q_add such 
+	** that we can ensure that updating receiver->state is the last
+	** write operation: As once set, the receiver can continue,
+	** and if we don't have the reference count from the wake_q,
+	** yet, at that point we can later have a use-after-free 
+	** conditon and bogus wakeup .
+	**/
+	receiver->state = STATE_READY;
+}
+
+/** pipelined_receive() -- if there is task waiting in sys_mq_timesend() 
+** gets its message and put to the queue (we have one free place for sure). **/
+static inline void pipelined_receive(struct wake_q_head *wake_q,
+					struct mqueue_inode_info *info)
+{
+	struct ext_wait_queue *sender = wq_get_first_waiter(info, SEND);
+	
+	if(!sender) {
+		/** for poll **/
+		wake_up_interruptble(&info->wait_q);
+		return;
+	}
+	
+	if(msg_insert(sender->msg, info))
+		return;
+	
+	list_del(&sender->list);
+	wake_q_add(wake_q, sender->task);
+	sender->state = STATE_READY;
+}
+
 
  
  
