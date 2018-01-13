@@ -1370,10 +1370,316 @@ out:
 
 
 
- 
- 
- 
- 
+ SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+			const struct sigevent __user *, u_notification)
+{
+	struct sigevent n, *p = NULL;
+	if(u_notification) {
+		if(copy_from_user(&n, u_notification, sizeof(struct sigevent)))
+			return -EFAULT;
+		p = &n;
+	}
+	return do_mq_notify(mqdes, p);
+}
+
+static int do_mq_getsetattr(int mqdes, struct mq_attr *new, struct mq_attr *old)
+{
+	struct fd f;
+	struct inode *inode;
+	struct mqueue_inode_info *info;
+	
+	if(new && (new->mq_flags & (~O_NONBLOCK)))
+		return -EINVAL;
+	
+	f = fdget(mqdes);
+	if(!f.file)
+		return -EBADF;
+	if(unlikely(f.file->f_op != &mqueue_file_operations)) {
+		fdput(f);
+		return -EBADF;
+	}
+	inode = file_inode(f.file);
+	info = MQUEUE_I(inode);
+	
+	spin_lock(&info->lock);
+	
+	if(old) {
+		*old = info->attr;
+		old->mq_flags = f.file->f_flags & O_NONBLOCK;
+	}
+	
+	if(new) {
+		audit_mq_getsetattr(mqdes, new);
+		spin_lock(&f.file->f_lock);
+		if(new->mq_flags & O_NONBLOCK)
+			f.file->f_flags |= O_NONBLOCK;
+		else
+			f.file->f_flags &= ~O_NONBLOCK;
+		spin_unlock(&f.file->f_lock);
+		
+		inode->i_atime = inode->i_ctime = current_time(inode);
+	}
+	spin_unlock(&info->lock);
+	fdput(f);
+	return 0;
+}
+
+SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
+			const struct mq_attr __user*, u_mqstat,
+			struct mq_attr __user *, u_omqstat)
+{
+	int ret;
+	struct mq_attr mqstat, omqstat;
+	struct mq_attr *new = NULL, *old = NULL;
+	
+	if(u_mqstat) {
+		new = &mqstat;
+		if(copy_from_user(new, u_mqstat, sizeof(struct mq_attr)))
+			return -EFAULT;
+	}
+	if(u_omqstat)
+		old = &omqstat;
+	
+	ret = do_mq_getsetattr(mqdes, new, old);
+	if(ret || !old)
+		return ret;
+	if(copy_to_user(u_omqstat, old, sizeof(struct mq_attr)))
+		return -EFAULT;
+	
+	return 0;
+}
+
+#ifdef CONFIG_COMPAT
+
+struct compat_mq_attr {
+	compat_long_t mq_flags; /** message queue flags **/
+	compat_long_t mq_maxmsg; /** maximum number of messages **/
+	compat_long_t mq_msgsize; /** maximum message size **/
+	compat_long_t mq_curmsgs; /** number of messages currently queued **/
+	compat_long_t __reserved[4]; /** ignored for input, zeroed for output **/
+};
+
+static inline int get_compat_mq_attr(struct mq_attr *attr,
+			const struct compat_mq_attr __user *uattr)
+{
+	struct compat_mq_attr v;
+	
+	if(copy_from_user(&v, uattr, sizeof(*uattr)))
+		return -EFAULT;
+	
+	memset(attr, 0, sizeof(*attr));
+	attr->mq_flags = v.mq_flags;
+	attr->mq_maxmsg = v.mq_maxmsg;
+	attr->mq_msgsize = v.mq_msgsize;
+	attr->mq_curmsg = v.mq_curmsg;
+	
+	return 0;
+}
+
+
+static inline int put_compat_mq_attr(const struct mq_attr *attr,
+				struct compat_mq_attr __user *uattr)
+{
+	struct compat_mq_attr v;
+	
+	memset(&v, 0, sizeof(v));
+	v.mq_flags = attr->mq_flags;
+	v.mq_maxmsg = attr->mq_maxmsg;
+	v.mq_msgsize = attr->mq_msgsize;
+	v.mq_curmsgs = attr->mq_curmsgs;
+	if(copy_to_user(uattr, &v, sizeof(*uattr)))
+		return -EFAULT;
+	return 0;
+}
+
+COMPAT_SYSCALL_DEFINE4(mq_open, const char __user *, u_name,
+				int, oflag, compat_mode_t, mode,
+				struct compat_mq_attr __user *, u_attr)
+{
+	struct mq_attr attr, *p = NULL;
+	if(u_attr && oflag & O_CREAT) {
+		p = &attr;
+		if(get_compat_mq_attr(&attr, u_attr))
+			return -EFAULT;
+	}
+	return do_mq_open(u_name, oflag, mode, p);
+}
+
+static int compat_prepare_timeout(const struct compat_timespec __user *p, 
+			struct timespec *ts)
+{
+	if(compat_get_timespec(ts, p))
+		return -EFAULT;
+	if(!timespec_valid(ts))
+		return -EINVAL;
+	return 0;
+}
+
+COMPAT_SYSCALL_DEFINE5(mq_timedsend, mqd_t, mqdes,
+				const char __user *, u_msg_ptr,
+				compat_size_t, msg_len, unsigned int, msg_prio,
+				const struct compat_timespec __user *, u_abs_timeout)
+{
+	struct timespec ts, *p = NULL;
+	if(u_abs_timeout) {
+		int res = compat_prepare_timeout(u_abs_timeout, &ts);
+		if(res)
+			return res;
+		p =&ts;
+	}
+	return do_mq_timedsend(mqdes, u_msg_ptr, msg_len, msg_prio, p);
+}
+
+COMPAT_SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes,
+			char __user *, u_msg_ptr,
+			compat_size_t, msg_len, unsigned int __user *, u_msg_prio,
+			const struct compat_timespec __user *, u_abs_timeout)
+{
+	struct timespec ts, *p = NULL;
+	if(u_abs_timeout) {
+		int res = compat_prepare_timeout(u_abs_timeout, &ts);
+		if(res)
+			return res;
+		p = &ts;
+	}
+	return do_mq_timedreceive(mqdes, u_msg_ptr, msg_len, u_msg_prio, p);
+}
+
+
+COMPAT_SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+			const struct compat_sigevent __user *, u_notification)
+{
+	struct sigevent n, *p = NULL;
+	if(u_notification) {
+		if(get_compat_sigevent(&n, u_notification))
+			return -EFAULT;
+		if(n.sigev_notify == SIGEV_THREAD)
+			n.sigev_value.sival_ptr = compat_ptr(n.sigev_value.sival_int);
+		p = &n;
+	}
+	return do_mq_notify(mqdes, p);
+}
+
+COMPAT_SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
+				const struct compat_mq_attr __user*, u_mqstat,
+				struct compat_mq_attr __user*, u_omqstat)
+{
+	int ret;
+	struct mq_attr mqstat, omqstat;
+	struct mq_attr *new = NULL, *old = NULL;
+	
+	if(u_mqstat) {
+		new = &mqstat;
+		if(get_compat_mq_attr(new, u_mqstat))
+			return -EFAULT;
+	}
+	if(u_omqstat)
+		old = &omqstat;
+	
+	ret = do_mq_getsetattr(mqdes, new, old);
+	if(ret || !old)
+		return ret;
+	
+	if(put_compat_mq_attr(old, u_omqstat))
+		return -EFAULT;
+	return 0;
+}
+
+#endif
+
+static const struct inode_operations mqueue_dir_inode_operations = {
+	.lookup = simple_lookup,
+	.create = mqueue_create,
+	.unlink = mqueue_unlink,
+};
+
+static const struct file_operations mqueue_file_operations = {
+	.flush = mqueue_flush_file,
+	.poll = mqueue_poll_file,
+	.read = mqueue_read_file,
+	.llseek = default_llseek,
+};
+
+static const struct super_operations mqueue_super_ops = {
+	.alloc_inode = mqueue_alloc_inode,
+	.destroy_inode = mqueue_destroy_inode,
+	.evict_inode = mqueue_evict_inode,
+	.statfs = simple_statfs,
+};
+
+static struct file_system_type mqueue_fs_type = {
+	.name = "mqueue",
+	.mount = mqueue_mount,
+	.kill_sb = kill_litter_super,
+	.fs_flags = FS_USERNS_MOUNT,
+};
+
+int mq_init_ns(struct struct ipc_namespace *ns)
+{
+	ns->mq_queues_count = 0;
+	ns->mq_queues_max = DFLT_QUEUEMAX;
+	ns->mq_msg_max    = DFLT_MSGMAX;
+	ns->mq_msgsize_max = DFLT_MSGSIZEMAX;
+	ns->mq_msg_default = DFLT_MSG;
+	ns->mq_msgsize_default = DFLT_MSGSIZE;
+	
+	ns->mq_mnt = kern_mount_data(&mqueue_fs_type, ns);
+	if(IS_ERR(ns->mq_mnt)) {
+		int err = PTR_ERR(ns->mq_mnt);
+		ns->mq_mnt = NULL;
+		return err;
+	}
+	
+	return 0;
+}
+
+void mq_clear_sbinfo(struct ipc_namespace *ns)
+{
+	ns->mq_mnt->mnt_sb->s_fs_info = NULL;
+}
+
+void mq_put_mnt(struct ipc_namespace *ns)
+{
+	kern_unmount(ns->mq_mnt);
+}
+
+static int __init init_mqueue_fs(void)
+{
+	int error;
+	
+	mqueue_inode_cachep = kmem_cache_create("mqueue_inode_cache",
+							sizeof(struct mqueue_inode_info), 0,
+							SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT, init_once);
+	if(mqueue_inode_cachep == NULL)
+		return -ENOMEM;
+	
+	/** ignore failures - they are not fatal **/
+	mq_sysctl_table = mq_register_sysctl_table();
+	
+	error = register_filesystem(&mqueue_fs_type);
+	if(error)
+		goto out_sysctl;
+	spin_lock_init(&mq_lock);
+	
+	error = mq_init_ns(&init_ipc_ns);
+	if(error)
+		goto out_filesystem;
+	
+	return 0;
+	
+out_filesystem:
+	unregister_filesystem(&mqueue_fs_type);
+out_sysctl:
+	if(mq_sysctl_table)
+		unregister_sysctl_table(mq_sysctl_table);
+	kmem_cache_destroy(mqueue_inode_cachep);
+	
+	return error;
+}
+
+device_initcall(init_mqueue_fs);
+
+
  
  
  
